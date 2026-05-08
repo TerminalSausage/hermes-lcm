@@ -1,6 +1,7 @@
 """Tests for LCM core components: store, DAG, tokens, config, escalation."""
 
 import json
+import re
 import sqlite3
 import sys
 import threading
@@ -24,9 +25,35 @@ from hermes_lcm.session_patterns import (
     compile_session_patterns,
     matches_session_pattern,
 )
+from hermes_lcm import message_patterns as message_patterns_mod
+from hermes_lcm.message_patterns import (
+    compile_message_patterns,
+    matches_message_pattern,
+)
 
 
 class TestModelRouting:
+    def _install_fake_provider_modules(self, monkeypatch, *, named_custom=None, registry=None):
+        hermes_cli = ModuleType("hermes_cli")
+        hermes_cli.__path__ = []
+
+        runtime_provider = ModuleType("hermes_cli.runtime_provider")
+        named_custom = named_custom or {}
+
+        def fake_get_named_custom_provider(provider):
+            return named_custom.get(provider)
+
+        runtime_provider._get_named_custom_provider = fake_get_named_custom_provider
+
+        auth = ModuleType("hermes_cli.auth")
+        auth.PROVIDER_REGISTRY = registry or {}
+
+        hermes_cli.runtime_provider = runtime_provider
+        hermes_cli.auth = auth
+        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider)
+        monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth)
+
     def test_provider_prefixed_model_stays_model_only_when_provider_unresolved(self):
         from hermes_lcm.model_routing import parse_lcm_model_override
 
@@ -48,6 +75,59 @@ class TestModelRouting:
 
         assert route.provider == "cerebras"
         assert route.model == "gpt-oss-120b"
+
+    def test_custom_provider_prefixed_model_is_split_when_provider_resolves(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override(
+            "my-provider/model-a",
+            provider_resolver=lambda provider: provider == "my-provider",
+        )
+
+        assert route.provider == "my-provider"
+        assert route.model == "model-a"
+
+    def test_canonical_provider_name_stays_model_only_even_if_custom_config_exists(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(
+            monkeypatch,
+            named_custom={"openai-codex": {"base_url": "https://example.invalid/v1"}},
+            registry={"openai-codex": object()},
+        )
+
+        route = parse_lcm_model_override("openai-codex/gpt-5.4-mini")
+
+        assert route.provider is None
+        assert route.model == "openai-codex/gpt-5.4-mini"
+
+    def test_custom_prefixed_canonical_provider_stays_model_only(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(
+            monkeypatch,
+            named_custom={"custom:openai-codex": {"base_url": "https://example.invalid/v1"}},
+            registry={"openai-codex": object()},
+        )
+
+        route = parse_lcm_model_override("custom:openai-codex/gpt-5.4-mini")
+
+        assert route.provider is None
+        assert route.model == "custom:openai-codex/gpt-5.4-mini"
+
+    def test_config_backed_non_canonical_custom_provider_is_split(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(
+            monkeypatch,
+            named_custom={"my-provider": {"base_url": "https://example.invalid/v1"}},
+            registry={"openai-codex": object()},
+        )
+
+        route = parse_lcm_model_override("my-provider/model-a")
+
+        assert route.provider == "my-provider"
+        assert route.model == "model-a"
 
     def test_openrouter_organization_slug_stays_model_only(self):
         from hermes_lcm.model_routing import parse_lcm_model_override
@@ -224,10 +304,13 @@ class TestConfig:
         assert c.deferred_maintenance_max_passes == 4
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
+        assert c.ignore_message_patterns == []
         assert c.ignore_session_patterns_source == "default"
         assert c.stateless_session_patterns_source == "default"
+        assert c.ignore_message_patterns_source == "default"
         assert c.summary_model == ""
         assert c.expansion_model == ""
+        assert c.expansion_context_tokens == 32_000
         assert c.summary_timeout_ms == 60_000
         assert c.expansion_timeout_ms == 120_000
 
@@ -236,7 +319,12 @@ class TestConfig:
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "0.80")
         monkeypatch.setenv("LCM_IGNORE_SESSION_PATTERNS", "cron:*,subagent:**")
         monkeypatch.setenv("LCM_STATELESS_SESSION_PATTERNS", "telegram:*, cli:debug")
+        monkeypatch.setenv(
+            "LCM_IGNORE_MESSAGE_PATTERNS",
+            "^Cronjob Response:,^>>>Cronjob Response<<<:",
+        )
         monkeypatch.setenv("LCM_EXPANSION_MODEL", "openai/gpt-5.4-mini")
+        monkeypatch.setenv("LCM_EXPANSION_CONTEXT_TOKENS", "64000")
         monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", "45000")
         monkeypatch.setenv("LCM_EXPANSION_TIMEOUT_MS", "90000")
         monkeypatch.setenv("LCM_DYNAMIC_LEAF_CHUNK_ENABLED", "1")
@@ -256,9 +344,15 @@ class TestConfig:
         assert c.context_threshold == 0.80
         assert c.ignore_session_patterns == ["cron:*", "subagent:**"]
         assert c.stateless_session_patterns == ["telegram:*", "cli:debug"]
+        assert c.ignore_message_patterns == [
+            "^Cronjob Response:",
+            "^>>>Cronjob Response<<<:",
+        ]
         assert c.ignore_session_patterns_source == "env"
         assert c.stateless_session_patterns_source == "env"
+        assert c.ignore_message_patterns_source == "env"
         assert c.expansion_model == "openai/gpt-5.4-mini"
+        assert c.expansion_context_tokens == 64_000
         assert c.summary_timeout_ms == 45_000
         assert c.expansion_timeout_ms == 90_000
         assert c.dynamic_leaf_chunk_enabled is True
@@ -274,12 +368,14 @@ class TestConfig:
         assert c.large_output_externalization_path == "/tmp/lcm-large-outputs"
         assert c.large_output_transcript_gc_enabled is True
 
-    def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch):
+    def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-hermes-home"))
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "not-a-number")
         monkeypatch.setenv("LCM_LEAF_CHUNK_TOKENS", "")
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "bad-float")
         monkeypatch.setenv("LCM_MAX_ASSEMBLY_TOKENS", "nope")
         monkeypatch.setenv("LCM_RESERVE_TOKENS_FLOOR", "still-nope")
+        monkeypatch.setenv("LCM_EXPANSION_CONTEXT_TOKENS", "nah")
 
         c = LCMConfig.from_env()
 
@@ -288,6 +384,43 @@ class TestConfig:
         assert c.context_threshold == 0.75
         assert c.max_assembly_tokens == 0
         assert c.reserve_tokens_floor == 0
+        assert c.expansion_context_tokens == 32_000
+
+    def test_from_env_reads_hermes_compression_threshold_when_lcm_env_missing(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("compression:\n  threshold: 0.68\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.68
+
+    def test_from_env_lcm_threshold_env_overrides_hermes_config(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("compression:\n  threshold: 0.68\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "0.82")
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.82
+
+    def test_from_env_reads_hermes_threshold_without_pyyaml(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("compression:\n  threshold: '0.68'\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.68
 
 
 class TestSessionPatterns:
@@ -322,6 +455,129 @@ class TestSessionPatterns:
         )
 
 
+class _FakeTimeoutPattern:
+    def __init__(self, pattern):
+        self.pattern = pattern
+        self._compiled = re.compile(pattern)
+
+    def search(self, text, *, timeout=None):
+        assert timeout is not None
+        return self._compiled.search(text)
+
+
+class _FakeTimeoutRegexEngine:
+    error = re.error
+
+    @staticmethod
+    def compile(pattern):
+        return _FakeTimeoutPattern(pattern)
+
+
+class TestMessagePatterns:
+    @pytest.fixture(autouse=True)
+    def _timeout_capable_regex_engine(self, monkeypatch):
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+
+    def test_compile_and_match_anchored_prefix(self):
+        patterns = compile_message_patterns(["^Cronjob Response:"])
+        assert len(patterns) == 1
+        assert matches_message_pattern("Cronjob Response: heartbeat ok", patterns)
+        assert not matches_message_pattern("could you check the cronjob response?", patterns)
+
+    def test_compile_inline_flags_and_wrapper_variants(self):
+        patterns = compile_message_patterns([r"(?is)^\s*(>>>\s*)?Cronjob Response"])
+        assert matches_message_pattern("Cronjob Response: heartbeat", patterns)
+        assert matches_message_pattern("   >>> Cronjob Response: heartbeat", patterns)
+        assert matches_message_pattern("\n  cronjob response: heartbeat", patterns)
+        assert not matches_message_pattern("normal user message", patterns)
+
+    def test_empty_patterns_never_match(self):
+        assert matches_message_pattern("Cronjob Response: x", []) is False
+
+    def test_empty_or_none_text_does_not_match(self):
+        patterns = compile_message_patterns(["^Cronjob"])
+        assert matches_message_pattern("", patterns) is False
+        assert matches_message_pattern(None, patterns) is False
+
+    def test_invalid_regex_is_logged_and_dropped(self, caplog):
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            compiled = compile_message_patterns(["[unclosed"])
+        assert compiled == []
+        assert "skipping invalid regex" in caplog.text
+        assert "[unclosed" in caplog.text
+
+    def test_mixed_validity_keeps_valid_patterns(self, caplog):
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            compiled = compile_message_patterns(
+                ["^Cronjob Response:", "[unclosed", "^Other:"]
+            )
+        assert len(compiled) == 2
+        assert matches_message_pattern("Cronjob Response: x", compiled)
+        assert matches_message_pattern("Other: y", compiled)
+        assert caplog.text.count("skipping invalid regex") == 1
+
+    def test_timed_out_pattern_is_skipped_once_and_later_patterns_still_match(self, caplog):
+        class TimedOutPattern:
+            pattern = "(a+)+$"
+
+            def search(self, text, *, timeout=None):
+                if timeout is None:
+                    raise AssertionError("message pattern search must pass a timeout")
+                raise TimeoutError("regex timed out")
+
+        class MatchingPattern:
+            pattern = "^Other:"
+
+            def search(self, text, *, timeout=None):
+                if timeout is None:
+                    raise AssertionError("message pattern search must pass a timeout")
+                return text.startswith("Other:")
+
+        patterns = [TimedOutPattern(), MatchingPattern()]
+
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            assert matches_message_pattern("Other: y", patterns) is True
+            assert matches_message_pattern("normal text", patterns) is False
+
+        assert caplog.text.count("timed out") == 1
+        assert "(a+)+$" in caplog.text
+
+    def test_missing_regex_dependency_disables_message_patterns(self, monkeypatch, caplog):
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", None)
+        monkeypatch.setattr(message_patterns_mod, "_MISSING_REGEX_WARNING_EMITTED", False)
+
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            compiled = compile_message_patterns([r"(a+)+$"])
+
+        assert compiled == []
+        assert "regex" in caplog.text
+        assert "disabled" in caplog.text
+        assert matches_message_pattern("a" * 30 + "!", compiled) is False
+
+    def test_pattern_without_timeout_support_is_skipped_without_unsafe_retry(self, caplog):
+        class StdlibLikePattern:
+            pattern = r"(a+)+$"
+
+            def __init__(self):
+                self.timeout_attempts = 0
+                self.unsafe_attempts = 0
+
+            def search(self, text, **kwargs):
+                if "timeout" in kwargs:
+                    self.timeout_attempts += 1
+                    raise TypeError("'timeout' is an invalid keyword argument for search()")
+                self.unsafe_attempts += 1
+                raise AssertionError("must not retry without timeout")
+
+        pattern = StdlibLikePattern()
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            assert matches_message_pattern("a" * 30 + "!", [pattern]) is False
+
+        assert pattern.timeout_attempts == 1
+        assert pattern.unsafe_attempts == 0
+        assert "does not support timeout" in caplog.text
+
+
 class TestTokens:
     def test_count_tokens_empty(self):
         assert count_tokens("") == 0
@@ -332,6 +588,20 @@ class TestTokens:
     def test_count_message_tokens(self):
         msg = {"role": "user", "content": "hello world this is a test"}
         assert count_message_tokens(msg) > 0
+
+    def test_count_message_tokens_normalizes_content_parts(self):
+        content = [
+            {"type": "text", "text": "hello from content parts " * 50},
+            {"type": "image_url", "image_url": {"url": "file:///tmp/example.png"}},
+        ]
+        msg = {"role": "user", "content": content}
+        normalized_msg = {
+            "role": "user",
+            "content": json.dumps(content, ensure_ascii=False, sort_keys=True),
+        }
+
+        assert count_message_tokens(msg) == count_message_tokens(normalized_msg)
+        assert count_message_tokens(msg) > 100
 
     def test_count_messages_tokens(self):
         msgs = [
@@ -363,6 +633,36 @@ class TestMessageStore:
         assert len(ids) == 3
         assert ids[0] < ids[1] < ids[2]
 
+    def test_append_batch_accepts_content_parts(self, store):
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello from content parts"},
+                    {"type": "image_url", "image_url": {"url": "file:///tmp/example.png"}},
+                ],
+            }
+        ]
+
+        ids = store.append_batch("sess1", msgs, [7], source="telegram")
+
+        retrieved = store.get(ids[0])
+        assert isinstance(retrieved["content"], str)
+        assert "hello from content parts" in retrieved["content"]
+        results = store.search("hello", session_id="sess1")
+        assert [result["store_id"] for result in results] == ids
+
+    def test_append_accepts_content_parts(self, store):
+        sid = store.append(
+            "sess1",
+            {"role": "assistant", "content": [{"type": "text", "text": "assistant part text"}]},
+            token_estimate=3,
+        )
+
+        retrieved = store.get(sid)
+        assert isinstance(retrieved["content"], str)
+        assert "assistant part text" in retrieved["content"]
+
     def test_get_range(self, store):
         msgs = [{"role": "user", "content": f"msg {i}"} for i in range(10)]
         ids = store.append_batch("sess1", msgs)
@@ -380,6 +680,27 @@ class TestMessageStore:
         store.append("sess1", {"role": "assistant", "content": "running kubectl"})
         results = store.search("docker", session_id="sess1")
         assert len(results) >= 1
+
+    def test_search_empty_session_id_does_not_search_all_sessions(self, store):
+        store.append("sess1", {"role": "user", "content": "deploy docker from session one"})
+        store.append("sess2", {"role": "user", "content": "deploy docker from session two"})
+
+        scoped_results = store.search("docker", session_id="")
+        all_results = store.search("docker", session_id=None, limit=10)
+
+        assert scoped_results == []
+        assert {result["session_id"] for result in all_results} == {"sess1", "sess2"}
+
+    def test_search_like_fallback_empty_session_id_does_not_search_all_sessions(self, store):
+        store.append("sess1", {"role": "user", "content": "foo bar baz session one"})
+        store.append("sess2", {"role": "user", "content": "foo bar baz session two"})
+        store._conn.execute("DROP TABLE messages_fts")
+
+        scoped_results = store.search('foo"bar', session_id="")
+        all_results = store.search('foo"bar', session_id=None, limit=10)
+
+        assert scoped_results == []
+        assert {result["session_id"] for result in all_results} == {"sess1", "sess2"}
 
     def test_source_stored_and_filterable(self, store):
         store.append("sess1", {"role": "user", "content": "docker in cli"}, source="cli")
@@ -448,6 +769,87 @@ class TestMessageStore:
         assert stats["normalized_unknown_messages"] == 1
         assert stats["legacy_blank_source_messages"] == 1
         assert stats["effective_unknown_messages"] == 2
+
+        store.close()
+
+    def test_source_unknown_filter_matches_null_and_whitespace_legacy_source_rows(self, tmp_path):
+        db_path = tmp_path / "legacy-null-whitespace-source.db"
+        store = MessageStore(db_path)
+        for source in (None, "", "   ", "\t\n"):
+            store._conn.execute(
+                """INSERT INTO messages
+                   (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("legacy-session", source, "user", f"docker with {source!r} source", None, None, None, 1.0, 5, 0),
+            )
+        store._conn.commit()
+
+        results = store.search("docker", source="unknown")
+        fetched = [store.get(result["store_id"]) for result in results]
+
+        assert len(results) == 4
+        assert {result["source"] for result in results} == {"unknown"}
+        assert {item["source"] for item in fetched} == {"unknown"}
+
+        store.close()
+
+    def test_get_source_stats_treats_null_and_whitespace_as_legacy_blank(self, tmp_path):
+        db_path = tmp_path / "source-stats-legacy-shapes.db"
+        store = MessageStore(db_path)
+        store.append("sess-known", {"role": "user", "content": "cli message"}, source="cli")
+        store.append("sess-unknown", {"role": "user", "content": "unknown message"})
+        for source in (None, "", "   ", "\t\n"):
+            store._conn.execute(
+                """INSERT INTO messages
+                   (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("legacy-session", source, "user", "legacy source shape", None, None, None, 1.0, 5, 0),
+            )
+        store._conn.commit()
+
+        stats = store.get_source_stats()
+
+        assert stats["messages_total"] == 6
+        assert stats["attributed_messages"] == 1
+        assert stats["normalized_unknown_messages"] == 1
+        assert stats["legacy_blank_source_messages"] == 4
+        assert stats["effective_unknown_messages"] == 5
+
+        store.close()
+
+    def test_source_normalization_plan_and_apply_are_idempotent(self, tmp_path):
+        db_path = tmp_path / "source-normalization.db"
+        store = MessageStore(db_path)
+        store.append("sess-known", {"role": "user", "content": "cli message"}, source="cli")
+        store.append("sess-unknown", {"role": "user", "content": "unknown message"})
+        for session_id, source in (("legacy-a", None), ("legacy-a", ""), ("legacy-b", "   "), ("legacy-b", "\t\n")):
+            store._conn.execute(
+                """INSERT INTO messages
+                   (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, source, "user", "legacy source shape", None, None, None, 1.0, 5, 0),
+            )
+        store._conn.commit()
+
+        plan = store.get_source_normalization_plan()
+
+        assert plan["target_source"] == "unknown"
+        assert plan["would_update_messages"] == 4
+        assert plan["affected_sessions"] == 2
+        assert plan["stats_before"]["legacy_blank_source_messages"] == 4
+
+        first = store.normalize_legacy_blank_sources()
+        second = store.normalize_legacy_blank_sources()
+        stats = store.get_source_stats()
+
+        assert first["updated_messages"] == 4
+        assert first["stats_before"]["legacy_blank_source_messages"] == 4
+        assert first["stats_after"]["legacy_blank_source_messages"] == 0
+        assert second["updated_messages"] == 0
+        assert stats["messages_total"] == 6
+        assert stats["attributed_messages"] == 1
+        assert stats["normalized_unknown_messages"] == 5
+        assert stats["effective_unknown_messages"] == 5
 
         store.close()
 
@@ -1389,6 +1791,178 @@ class TestLifecycleStateStore:
 
         state.close()
 
+    def test_init_upgrades_existing_lifecycle_table_with_rotation_columns(self, tmp_path):
+        db_path = tmp_path / "legacy-lifecycle-rotation.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            INSERT INTO metadata(key, value) VALUES ('schema_version', '4');
+
+            CREATE TABLE lcm_migration_state (
+                step_name TEXT PRIMARY KEY,
+                completed_at REAL NOT NULL
+            );
+
+            CREATE TABLE lcm_lifecycle_state (
+                conversation_id TEXT PRIMARY KEY,
+                current_session_id TEXT,
+                last_finalized_session_id TEXT,
+                current_frontier_store_id INTEGER NOT NULL DEFAULT 0,
+                last_finalized_frontier_store_id INTEGER NOT NULL DEFAULT 0,
+                debt_kind TEXT,
+                debt_size_estimate INTEGER NOT NULL DEFAULT 0,
+                current_bound_at REAL,
+                last_finalized_at REAL,
+                debt_updated_at REAL,
+                last_maintenance_attempt_at REAL,
+                updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
+            INSERT INTO lcm_lifecycle_state(
+                conversation_id,
+                current_session_id,
+                last_finalized_session_id,
+                current_frontier_store_id,
+                last_finalized_frontier_store_id,
+                debt_kind,
+                debt_size_estimate,
+                current_bound_at,
+                last_finalized_at,
+                debt_updated_at,
+                last_maintenance_attempt_at,
+                updated_at
+            ) VALUES ('conv', 'sess', NULL, 7, 0, NULL, 0, 1.0, NULL, NULL, NULL, 2.0);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        state = LifecycleStateStore(db_path)
+        loaded = state.get_by_session("sess")
+
+        assert loaded is not None
+        assert loaded.current_session_id == "sess"
+        assert loaded.current_frontier_store_id == 7
+        assert loaded.last_rollover_at is None
+        assert loaded.last_reset_at is None
+
+        columns = {
+            row[1]
+            for row in state._conn.execute("PRAGMA table_info(lcm_lifecycle_state)").fetchall()
+        }
+        assert {"last_rollover_at", "last_reset_at"} <= columns
+
+        state.close()
+
+    def test_lifecycle_fragmentation_stats_compare_lifecycle_to_lcm_content_and_state_db(self, tmp_path):
+        db_path = tmp_path / "lifecycle-fragmentation.db"
+        state_db = tmp_path / "state.db"
+        # Initialize all shared LCM tables; fragmentation diagnostics compare
+        # lifecycle rows against raw-message and summary-DAG session coverage.
+        store = MessageStore(db_path)
+        dag = SummaryDAG(db_path)
+        state = LifecycleStateStore(db_path)
+        conn = state._conn
+        conn.execute(
+            """INSERT INTO messages
+               (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("message-only", "cli", "user", "message only", None, None, None, 1.0, 5, 0),
+        )
+        conn.execute(
+            """INSERT INTO summary_nodes
+               (session_id, depth, summary, token_count, source_token_count, source_ids, source_type, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("node-only", 0, "node only", 5, 5, "[]", "messages", 1.0),
+        )
+        conn.execute(
+            """INSERT INTO lcm_lifecycle_state
+               (conversation_id, current_session_id, last_finalized_session_id, current_frontier_store_id, last_finalized_frontier_store_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("conv-live", "message-only", "node-only", 0, 0, 1.0),
+        )
+        conn.execute(
+            """INSERT INTO lcm_lifecycle_state
+               (conversation_id, current_session_id, last_finalized_session_id, current_frontier_store_id, last_finalized_frontier_store_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("conv-missing", "missing-current", "missing-final", 0, 0, 1.0),
+        )
+        conn.commit()
+        state_conn = sqlite3.connect(state_db)
+        state_conn.executescript(
+            """
+            CREATE TABLE sessions (id TEXT PRIMARY KEY);
+            INSERT INTO sessions(id) VALUES ('message-only');
+            INSERT INTO sessions(id) VALUES ('state-only');
+            """
+        )
+        state_conn.commit()
+        state_conn.close()
+
+        stats = state.get_fragmentation_stats(state_db_path=state_db)
+
+        assert stats["lifecycle_rows"] == 2
+        assert stats["distinct_message_sessions"] == 1
+        assert stats["distinct_node_sessions"] == 1
+        assert stats["lifecycle_current_missing_in_messages"] == 1
+        assert stats["lifecycle_current_missing_in_lcm_any"] == 1
+        assert stats["lifecycle_last_finalized_missing_in_lcm_any"] == 1
+        assert stats["lifecycle_current_missing_in_state"] == 1
+        assert stats["lifecycle_last_finalized_missing_in_state"] == 2
+        assert stats["lcm_message_sessions_missing_in_state"] == 0
+        assert stats["lcm_node_sessions_missing_in_state"] == 1
+        assert stats["state_sessions_missing_in_lcm_any"] == 1
+        assert stats["state_db_checked"] is True
+        assert stats["state_db_error"] == ""
+
+        # Read-only diagnostic: no lifecycle rows were mutated or removed.
+        assert state.row_count() == 2
+        assert state.get_by_conversation("conv-missing").current_session_id == "missing-current"
+
+        state.close()
+
+    def test_lifecycle_fragmentation_stats_treats_last_finalized_message_session_as_referenced(self, tmp_path):
+        db_path = tmp_path / "lifecycle-finalized-message-reference.db"
+        store = MessageStore(db_path)
+        SummaryDAG(db_path)
+        state = LifecycleStateStore(db_path)
+        store.append("previous-session", {"role": "user", "content": "previous"}, source="cli")
+        store.append("current-session", {"role": "user", "content": "current"}, source="cli")
+        state.record_rollover(
+            "conversation",
+            old_session_id="previous-session",
+            new_session_id="current-session",
+        )
+
+        stats = state.get_fragmentation_stats()
+
+        assert stats["message_sessions_without_lifecycle_current"] == 1
+        assert stats["message_sessions_without_lifecycle_reference"] == 0
+        assert stats["node_sessions_without_lifecycle_reference"] == 0
+
+        state.close()
+
+    def test_lifecycle_fragmentation_stats_reports_existing_malformed_state_db(self, tmp_path):
+        db_path = tmp_path / "lifecycle-malformed-state.db"
+        state_db = tmp_path / "state.db"
+        MessageStore(db_path)
+        SummaryDAG(db_path)
+        state = LifecycleStateStore(db_path)
+        state_db.write_text("not sqlite")
+
+        stats = state.get_fragmentation_stats(state_db_path=state_db)
+
+        assert stats["state_db_checked"] is True
+        assert stats["state_db_error"]
+        assert stats["read_only"] is True
+        assert state.row_count() == 0
+
+        state.close()
+
     def test_record_debt_and_clear_debt(self, tmp_path):
         state = LifecycleStateStore(tmp_path / "lifecycle-debt.db")
         bound = state.bind_session("sess-1")
@@ -1470,6 +2044,30 @@ class TestSummaryDAG:
     def dag(self, tmp_path):
         return SummaryDAG(tmp_path / "test.db")
 
+    def _assert_write_lock_obtainable(self, db_path):
+        conn = sqlite3.connect(db_path, timeout=0.1)
+        conn.execute("PRAGMA busy_timeout=100")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def test_noop_write_helpers_do_not_leave_database_locked(self, tmp_path):
+        db_path = tmp_path / "noop-write-lock.db"
+        dag = SummaryDAG(db_path)
+
+        assert dag.reassign_session_nodes("missing-old", "missing-new") == 0
+        self._assert_write_lock_obtainable(db_path)
+
+        assert dag.delete_session_nodes("missing-session") == 0
+        self._assert_write_lock_obtainable(db_path)
+
+        assert dag.delete_below_depth("missing-session", 1) == 0
+        self._assert_write_lock_obtainable(db_path)
+
+        dag.close()
+
     def test_add_and_get(self, dag):
         node = SummaryNode(
             session_id="s1", depth=0,
@@ -1517,6 +2115,43 @@ class TestSummaryDAG:
         ))
         results = dag.search("Docker", session_id="s1")
         assert len(results) >= 1
+
+    def test_search_empty_session_id_does_not_search_all_sessions(self, dag):
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Docker containers for session one",
+            token_count=10, source_ids=[1], source_type="messages",
+        ))
+        dag.add_node(SummaryNode(
+            session_id="s2", depth=0,
+            summary="Docker containers for session two",
+            token_count=10, source_ids=[2], source_type="messages",
+        ))
+
+        scoped_results = dag.search("Docker", session_id="")
+        all_results = dag.search("Docker", session_id=None, limit=10)
+
+        assert scoped_results == []
+        assert {node.session_id for node in all_results} == {"s1", "s2"}
+
+    def test_search_like_fallback_empty_session_id_does_not_search_all_sessions(self, dag):
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="foo bar baz session one",
+            token_count=10, source_ids=[1], source_type="messages",
+        ))
+        dag.add_node(SummaryNode(
+            session_id="s2", depth=0,
+            summary="foo bar baz session two",
+            token_count=10, source_ids=[2], source_type="messages",
+        ))
+        dag._conn.execute("DROP TABLE nodes_fts")
+
+        scoped_results = dag.search('foo"bar', session_id="")
+        all_results = dag.search('foo"bar', session_id=None, limit=10)
+
+        assert scoped_results == []
+        assert {node.session_id for node in all_results} == {"s1", "s2"}
 
     def test_init_repairs_malformed_nodes_fts_and_sets_schema_version(self, tmp_path):
         db_path = tmp_path / "legacy-dag.db"

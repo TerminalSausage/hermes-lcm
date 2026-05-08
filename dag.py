@@ -42,7 +42,7 @@ from .search_query import (
     sanitize_fts5_query,
     should_apply_directness_rank_adjustment,
 )
-from .store import _normalize_source_value, _UNKNOWN_SOURCE
+from .store import _normalize_source_value, _UNKNOWN_SOURCE, _legacy_blank_source_clause
 
 
 logger = logging.getLogger(__name__)
@@ -105,6 +105,31 @@ def _fts_primary_value(node: "SummaryNode", sort: str | None) -> float:
     return rank_value
 
 
+def build_nodes_fts_spec() -> ExternalContentFtsSpec:
+    return ExternalContentFtsSpec(
+        table_name="nodes_fts",
+        content_table="summary_nodes",
+        content_rowid="node_id",
+        indexed_column="summary",
+        trigger_sqls=(
+            """
+            CREATE TRIGGER IF NOT EXISTS nodes_fts_insert
+                AFTER INSERT ON summary_nodes BEGIN
+                INSERT INTO nodes_fts(rowid, summary)
+                    VALUES (new.node_id, new.summary);
+            END;
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS nodes_fts_delete
+                AFTER DELETE ON summary_nodes BEGIN
+                INSERT INTO nodes_fts(nodes_fts, rowid, summary)
+                    VALUES('delete', old.node_id, old.summary);
+            END;
+            """,
+        ),
+    )
+
+
 @dataclass
 class SummaryNode:
     """A single node in the summary DAG."""
@@ -160,28 +185,7 @@ class SummaryDAG:
         """)
         ensure_external_content_fts(
             self._conn,
-            ExternalContentFtsSpec(
-                table_name="nodes_fts",
-                content_table="summary_nodes",
-                content_rowid="node_id",
-                indexed_column="summary",
-                trigger_sqls=(
-                    """
-                    CREATE TRIGGER IF NOT EXISTS nodes_fts_insert
-                        AFTER INSERT ON summary_nodes BEGIN
-                        INSERT INTO nodes_fts(rowid, summary)
-                            VALUES (new.node_id, new.summary);
-                    END;
-                    """,
-                    """
-                    CREATE TRIGGER IF NOT EXISTS nodes_fts_delete
-                        AFTER DELETE ON summary_nodes BEGIN
-                        INSERT INTO nodes_fts(nodes_fts, rowid, summary)
-                            VALUES('delete', old.node_id, old.summary);
-                    END;
-                    """,
-                ),
-            ),
+            build_nodes_fts_spec(),
         )
         run_versioned_migrations(self._conn)
         self._ensure_source_window_columns()
@@ -238,8 +242,7 @@ class SummaryDAG:
             (session_id, min_depth),
         )
         deleted = cur.rowcount
-        if deleted:
-            self._conn.commit()
+        self._conn.commit()
         return deleted
 
     def delete_session_nodes(self, session_id: str) -> int:
@@ -249,8 +252,7 @@ class SummaryDAG:
             (session_id,),
         )
         deleted = cur.rowcount
-        if deleted:
-            self._conn.commit()
+        self._conn.commit()
         return deleted
 
     def reassign_session_nodes(self, old_session_id: str, new_session_id: str) -> int:
@@ -264,8 +266,7 @@ class SummaryDAG:
             (new_session_id, old_session_id),
         )
         moved = cur.rowcount
-        if moved:
-            self._conn.commit()
+        self._conn.commit()
         return moved
 
     # -- Read ---------------------------------------------------------------
@@ -334,6 +335,8 @@ class SummaryDAG:
 
         Retrieval contract:
         - ``session_id`` limits which sessions are eligible
+        - ``session_id=None`` means all sessions; an empty string is treated as
+          a literal session id
         - ``source`` filters summaries by descendant raw-message lineage, not by
           session-level source presence
         - mixed-source nodes may match more than one ``source`` filter
@@ -355,7 +358,7 @@ class SummaryDAG:
         source_match_cache: dict[int, bool] = {}
         while True:
             try:
-                if session_id:
+                if session_id is not None:
                     rows = self._conn.execute(
                         f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                            JOIN summary_nodes n ON n.node_id = fts.rowid
@@ -419,7 +422,7 @@ class SummaryDAG:
 
         where: list[str] = ["summary IS NOT NULL"]
         args: list[Any] = []
-        if session_id:
+        if session_id is not None:
             where.append("session_id = ?")
             args.append(session_id)
         like_clauses = []
@@ -483,8 +486,9 @@ class SummaryDAG:
         normalized_source = _normalize_source_value(source)
         if cache is not None and node_id in cache:
             return cache[node_id]
+        legacy_blank_clause = _legacy_blank_source_clause("m.source")
         row = self._conn.execute(
-            """
+            f"""
             WITH RECURSIVE source_walk(source_type, source_id) AS (
                 SELECT n.source_type, CAST(j.value AS INTEGER)
                 FROM summary_nodes n, json_each(n.source_ids) j
@@ -505,7 +509,7 @@ class SummaryDAG:
               ON walk.source_type = 'messages'
              AND m.store_id = walk.source_id
             WHERE CASE
-                    WHEN ? = ? THEN (m.source = ? OR m.source = '')
+                    WHEN ? = ? THEN (m.source = ? OR {legacy_blank_clause})
                     ELSE m.source = ?
                   END
             LIMIT 1

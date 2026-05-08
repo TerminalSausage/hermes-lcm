@@ -7,7 +7,42 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
+from .db_bootstrap import external_content_fts_needs_repair, repair_external_content_fts
+from .dag import build_nodes_fts_spec
 from .session_patterns import build_session_match_keys, matches_session_pattern
+from .store import build_message_fts_spec
+
+
+def _state_db_path_for_engine(engine) -> Path:
+    hermes_home = getattr(engine, "_hermes_home", "") or ""
+    if hermes_home:
+        return Path(hermes_home).expanduser() / "state.db"
+    db_path = Path(getattr(engine._store, "db_path", Path.home() / ".hermes" / "lcm.db"))
+    return db_path.parent / "state.db"
+
+
+def _has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
+    direct_mismatch_keys = (
+        "lifecycle_current_missing_in_lcm_any",
+        "lifecycle_last_finalized_missing_in_lcm_any",
+        "lifecycle_current_missing_in_state",
+        "lifecycle_last_finalized_missing_in_state",
+        "lcm_message_sessions_missing_in_state",
+        "lcm_node_sessions_missing_in_state",
+    )
+    lifecycle_rows = int(stats.get("lifecycle_rows", 0) or 0)
+    missing_lifecycle_reference_keys = (
+        "message_sessions_without_lifecycle_reference",
+        "node_sessions_without_lifecycle_reference",
+    )
+    return (
+        any(int(stats.get(key, 0) or 0) > 0 for key in direct_mismatch_keys)
+        or (
+            lifecycle_rows > 0
+            and any(int(stats.get(key, 0) or 0) > 0 for key in missing_lifecycle_reference_keys)
+        )
+        or (bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error")))
+    )
 
 
 def _fmt_bool(value: Any) -> str:
@@ -38,6 +73,10 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm doctor: run read-only LCM health checks",
         "- /lcm doctor clean: best-effort scan of obvious junk/noise session candidates without deleting anything",
         "- /lcm doctor clean apply: backup-first cleanup for safe pattern-matched candidates only",
+        "- /lcm doctor repair: read-only scan for SQLite/FTS index repair needs",
+        "- /lcm doctor repair apply: backup-first repair/rebuild of message and summary FTS indexes",
+        "- /lcm doctor source: read-only scan for legacy blank-source rows",
+        "- /lcm doctor source apply: backup-first normalization of legacy blank-source rows to unknown",
         "- /lcm doctor retention: read-only retention analysis for stored session footprint and age",
         "- /lcm backup: create a timestamped SQLite backup before any future cleanup workflow",
         "- /lcm help: show this help",
@@ -50,8 +89,9 @@ def _status_text(engine) -> str:
     db_path = Path(engine._store.db_path)
     db_exists = db_path.exists()
     db_size = db_path.stat().st_size if db_exists else 0
-    session_bound = bool(engine._session_id)
+    session_bound = bool(engine.current_session_id)
     source_stats = status.get("source_lineage") or {}
+    runtime_identity = status.get("runtime_identity") or {}
     source_stats = {
         "messages_total": int(source_stats.get("messages_total", 0) or 0),
         "attributed_messages": int(source_stats.get("attributed_messages", 0) or 0),
@@ -65,15 +105,39 @@ def _status_text(engine) -> str:
     lines = [
         "LCM status",
         f"engine: {status.get('engine', engine.name)}",
-        f"session_id: {engine._session_id or '(unbound)'}",
-        f"session_platform: {status.get('session_platform') or ('(unbound)' if not session_bound else '(unknown)')}",
+        f"plugin_name: {runtime_identity.get('plugin_name', '(unknown)')}",
+        f"plugin_version: {runtime_identity.get('plugin_version', '(unknown)')}",
+        f"plugin_path: {runtime_identity.get('plugin_path', '(unknown)')}",
+        f"module_path: {runtime_identity.get('module_path', '(unknown)')}",
+        f"plugin_git_commit: {runtime_identity.get('plugin_git_commit') or '(unavailable)'}",
+        f"plugin_git_branch: {runtime_identity.get('plugin_git_branch') or '(unavailable)'}",
+        f"plugin_git_dirty: {runtime_identity.get('plugin_git_dirty') if runtime_identity.get('plugin_git_dirty') is not None else '(unavailable)'}",
+        f"hermes_home: {runtime_identity.get('hermes_home', '') or '(unset)'}",
+        f"session_id: {engine.current_session_id or '(unbound)'}",
+        f"session_platform: {engine.current_session_platform or ('(unbound)' if not session_bound else '(unknown)')}",
         f"database_path: {db_path}",
+        f"database_path_source: {runtime_identity.get('database_path_source', '(unknown)')}",
         f"database_exists: {_fmt_bool(db_exists)}",
         f"database_size: {_fmt_size(db_size) if db_exists else 'missing'}",
         f"compression_count: {engine.compression_count}",
         f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",
-        f"session_ignored: {_fmt_bool(status.get('session_ignored'))}",
-        f"session_stateless: {_fmt_bool(status.get('session_stateless'))}",
+        f"cache_metrics_available: {_fmt_bool(status.get('cache_metrics_available'))}",
+        f"last_input_tokens: {status.get('last_input_tokens', 0)}",
+        f"last_output_tokens: {status.get('last_output_tokens', 0)}",
+        f"last_cache_read_tokens: {status.get('last_cache_read_tokens', 0)}",
+        f"last_cache_write_tokens: {status.get('last_cache_write_tokens', 0)}",
+        f"last_reasoning_tokens: {status.get('last_reasoning_tokens', 0)}",
+        f"cache_read_ratio: {float(status.get('cache_read_ratio', 0.0) or 0.0) * 100:.1f}%",
+        # Filter classification for current_session_id (the foreground view).
+        # When a side channel is in flight, get_status() reports the bound
+        # session's flags; we read the engine properties instead so this row
+        # stays consistent with the session_id row above.
+        f"session_ignored: {_fmt_bool(engine.current_session_ignored)}",
+        f"session_stateless: {_fmt_bool(engine.current_session_stateless)}",
+        f"side_channel_active: {_fmt_bool(engine.side_channel_active)}",
+        f"conversation_id: {runtime_identity.get('conversation_id', '') or '(unbound)'}",
+        f"lifecycle_current_session_id: {runtime_identity.get('lifecycle_current_session_id', '') or '(none)'}",
+        f"lifecycle_last_finalized_session_id: {runtime_identity.get('lifecycle_last_finalized_session_id', '') or '(none)'}",
         f"source_messages_total: {source_stats['messages_total']}",
         f"source_attributed_messages: {source_stats['attributed_messages']}",
         f"source_unknown_messages: {source_stats['normalized_unknown_messages']}",
@@ -161,6 +225,12 @@ def _scan_clean_candidates(engine) -> dict[str, Any]:
             stateless_count += 1
         if not matched_classes:
             continue
+        # Protect the actively-bound session from cleanup, not the foreground
+        # view. While a cron tick has rebound the engine, _session_id points
+        # at the cron session and the engine is actively writing through it
+        # via lifecycle hooks; deleting that data mid-flight would corrupt
+        # the cleanup pass. current_session_id (foreground) is the wrong
+        # field here.
         if session_id == getattr(engine, "_session_id", ""):
             protected_count += 1
             continue
@@ -186,7 +256,13 @@ def _scan_clean_candidates(engine) -> dict[str, Any]:
 def _scan_retention_candidates(engine) -> dict[str, Any]:
     conn = engine._store._conn
     now = datetime.now().timestamp()
-    session_id = getattr(engine, "_session_id", "")
+    # SQL is scoped to the foreground session so /lcm doctor retention
+    # reports the operator's real conversation rather than whatever side
+    # channel (cron tick, debug probe) currently owns engine._session_id.
+    # The "protected" flag below still keys off engine._session_id (the
+    # actively-bound row) because that is the row receiving live writes
+    # from the concurrent run.
+    session_id = engine.current_session_id
     if not session_id:
         return {
             "error": None,
@@ -281,6 +357,8 @@ def _scan_retention_candidates(engine) -> dict[str, Any]:
         first_activity_at = min(float(ts) for ts in (first_message_at, first_node_at) if ts is not None)
         last_activity_at = max(float(ts) for ts in (last_message_at, last_node_at) if ts is not None)
         age_days = max(0.0, (now - last_activity_at) / 86400.0)
+        # Bound (not foreground): protect the live session from retention
+        # bookkeeping while the engine may still be writing to it.
         protected = session_id == getattr(engine, "_session_id", "")
         total_footprint_tokens = int(token_total) + int(node_token_total)
         if protected:
@@ -373,8 +451,208 @@ def _backup_database(engine) -> dict[str, Any]:
     }
 
 
+def _scan_fts_repair(engine) -> dict[str, Any]:
+    checks: dict[str, dict[str, Any]] = {}
+    specs = {
+        "messages_fts": build_message_fts_spec(),
+        "nodes_fts": build_nodes_fts_spec(),
+    }
+    conn = engine._store._conn
+    for label, spec in specs.items():
+        try:
+            needs_repair = external_content_fts_needs_repair(conn, spec)
+            content_count = int(conn.execute(
+                f"SELECT COUNT(*) FROM {spec.content_table}"
+            ).fetchone()[0])
+            try:
+                fts_count = int(conn.execute(f"SELECT COUNT(*) FROM {spec.table_name}").fetchone()[0])
+            except sqlite3.Error:
+                fts_count = None
+            checks[label] = {
+                "ok": not needs_repair,
+                "needs_repair": needs_repair,
+                "content_rows": content_count,
+                "fts_rows": fts_count,
+                "error": None,
+            }
+        except Exception as exc:  # pragma: no cover - defensive
+            checks[label] = {
+                "ok": False,
+                "needs_repair": True,
+                "content_rows": None,
+                "fts_rows": None,
+                "error": str(exc),
+            }
+    return {
+        "checks": checks,
+        "needs_repair": any(item["needs_repair"] for item in checks.values()),
+    }
+
+
+def _doctor_repair_text(engine) -> str:
+    scan = _scan_fts_repair(engine)
+    lines = [
+        "LCM doctor repair",
+        f"status: {'repair-needed' if scan['needs_repair'] else 'ok'}",
+    ]
+    for label, item in scan["checks"].items():
+        state = "repair-needed" if item["needs_repair"] else "ok"
+        lines.append(f"{label}: {state}")
+        if item["error"]:
+            lines.append(f"{label}_error: {item['error']}")
+        else:
+            lines.append(f"{label}_content_rows: {item['content_rows']}")
+            lines.append(f"{label}_fts_rows: {item['fts_rows']}")
+    lines.append("note: read-only scan only — no FTS tables were repaired")
+    if scan["needs_repair"]:
+        lines.append("note: use `/lcm doctor repair apply` to create a backup and repair FTS indexes")
+    return "\n".join(lines)
+
+
+def _doctor_repair_apply_text(engine) -> str:
+    backup = _backup_database(engine)
+    if not backup["ok"]:
+        return "\n".join([
+            "LCM doctor repair apply",
+            "status: error",
+            f"database_path: {backup['db_path']}",
+            f"error: backup failed: {backup['error']}",
+            "note: repair apply aborted before any FTS tables were repaired",
+        ])
+
+    conn = engine._store._conn
+    try:
+        messages_result = repair_external_content_fts(conn, build_message_fts_spec())
+        nodes_result = repair_external_content_fts(conn, build_nodes_fts_spec())
+    except sqlite3.Error as exc:
+        return "\n".join([
+            "LCM doctor repair apply",
+            "status: error",
+            f"database_path: {backup['db_path']}",
+            f"backup_path: {backup['backup_path']}",
+            f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+            f"error: FTS repair failed: {exc}",
+            "note: backup was created before repair apply",
+        ])
+
+    return "\n".join([
+        "LCM doctor repair apply",
+        "status: ok",
+        f"database_path: {backup['db_path']}",
+        f"backup_path: {backup['backup_path']}",
+        f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+        f"messages_fts_rebuilt: {_fmt_bool(messages_result['rebuilt'])}",
+        f"messages_fts_triggers_recreated: {_fmt_bool(messages_result['triggers_recreated'])}",
+        f"messages_fts_degraded: {_fmt_bool(messages_result['degraded'])}",
+        f"nodes_fts_rebuilt: {_fmt_bool(nodes_result['rebuilt'])}",
+        f"nodes_fts_triggers_recreated: {_fmt_bool(nodes_result['triggers_recreated'])}",
+        f"nodes_fts_degraded: {_fmt_bool(nodes_result['degraded'])}",
+        "note: backup created before repair apply",
+    ])
+
+
+def _doctor_source_text(engine) -> str:
+    try:
+        plan = engine._store.get_source_normalization_plan()
+    except Exception as exc:  # pragma: no cover - defensive
+        return "\n".join([
+            "LCM doctor source",
+            "status: error",
+            f"error: source-lineage scan failed: {exc}",
+            "note: read-only scan only — no source rows were updated",
+        ])
+
+    stats = plan["stats_before"]
+    would_update = int(plan["would_update_messages"])
+    lines = [
+        "LCM doctor source",
+        f"status: {'normalization-needed' if would_update else 'ok'}",
+        f"messages_total: {stats['messages_total']}",
+        f"attributed_messages: {stats['attributed_messages']}",
+        f"unknown_messages: {stats['normalized_unknown_messages']}",
+        f"legacy_blank_messages: {stats['legacy_blank_source_messages']}",
+        f"effective_unknown_messages: {stats['effective_unknown_messages']}",
+        f"target_source: {plan['target_source']}",
+        f"would_update_messages: {would_update}",
+        f"affected_sessions: {plan['affected_sessions']}",
+        "note: read-only scan only — no source rows were updated",
+    ]
+    if would_update:
+        lines.append(
+            "note: use `/lcm doctor source apply` to create a backup and normalize legacy blank-source rows"
+        )
+    else:
+        lines.append("note: no legacy blank-source rows need normalization")
+    return "\n".join(lines)
+
+
+def _doctor_source_apply_text(engine) -> str:
+    try:
+        plan = engine._store.get_source_normalization_plan()
+    except Exception as exc:  # pragma: no cover - defensive
+        return "\n".join([
+            "LCM doctor source apply",
+            "status: error",
+            f"error: source-lineage scan failed: {exc}",
+            "note: source normalization apply aborted before any rows were updated",
+        ])
+
+    if int(plan["would_update_messages"]) == 0:
+        stats = plan["stats_before"]
+        return "\n".join([
+            "LCM doctor source apply",
+            "status: ok",
+            f"target_source: {plan['target_source']}",
+            "updated_messages: 0",
+            f"legacy_blank_before: {stats['legacy_blank_source_messages']}",
+            f"legacy_blank_after: {stats['legacy_blank_source_messages']}",
+            "note: no legacy blank-source rows needed normalization",
+        ])
+
+    backup = _backup_database(engine)
+    if not backup["ok"]:
+        return "\n".join([
+            "LCM doctor source apply",
+            "status: error",
+            f"database_path: {backup['db_path']}",
+            f"error: backup failed: {backup['error']}",
+            "note: source normalization apply aborted before any rows were updated",
+        ])
+
+    try:
+        result = engine._store.normalize_legacy_blank_sources()
+    except sqlite3.Error as exc:
+        return "\n".join([
+            "LCM doctor source apply",
+            "status: error",
+            f"database_path: {backup['db_path']}",
+            f"backup_path: {backup['backup_path']}",
+            f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+            f"error: source normalization failed: {exc}",
+            "note: backup was created before source normalization apply",
+        ])
+
+    before = result["stats_before"]
+    after = result["stats_after"]
+    return "\n".join([
+        "LCM doctor source apply",
+        "status: ok",
+        f"database_path: {backup['db_path']}",
+        f"backup_path: {backup['backup_path']}",
+        f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+        f"target_source: {result['target_source']}",
+        f"updated_messages: {result['updated_messages']}",
+        f"legacy_blank_before: {before['legacy_blank_source_messages']}",
+        f"legacy_blank_after: {after['legacy_blank_source_messages']}",
+        f"unknown_before: {before['normalized_unknown_messages']}",
+        f"unknown_after: {after['normalized_unknown_messages']}",
+        "note: backup created before source normalization apply",
+    ])
+
+
 def _doctor_text(engine) -> str:
     db_path = Path(engine._store.db_path)
+    runtime_identity = engine.get_runtime_identity()
     store_conn = engine._store._conn
     dag_conn = engine._dag._conn
 
@@ -492,6 +770,40 @@ def _doctor_text(engine) -> str:
             "legacy blank-source rows are normalized as `source=unknown` for back-compat filters"
         )
 
+    try:
+        lifecycle_stats = engine._lifecycle.get_fragmentation_stats(
+            state_db_path=_state_db_path_for_engine(engine)
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        issues.append("lifecycle_fragmentation")
+        lifecycle_stats = {"error": str(exc)}
+    else:
+        observations.append(
+            "lifecycle_fragmentation: "
+            f"lifecycle_rows={lifecycle_stats['lifecycle_rows']} "
+            f"message_sessions={lifecycle_stats['distinct_message_sessions']} "
+            f"node_sessions={lifecycle_stats['distinct_node_sessions']} "
+            f"current_missing_in_lcm_any={lifecycle_stats['lifecycle_current_missing_in_lcm_any']} "
+            f"last_finalized_missing_in_lcm_any={lifecycle_stats['lifecycle_last_finalized_missing_in_lcm_any']} "
+            f"current_missing_in_state={lifecycle_stats['lifecycle_current_missing_in_state']} "
+            f"last_finalized_missing_in_state={lifecycle_stats['lifecycle_last_finalized_missing_in_state']} "
+            f"message_sessions_missing_in_state={lifecycle_stats['lcm_message_sessions_missing_in_state']} "
+            f"node_sessions_missing_in_state={lifecycle_stats['lcm_node_sessions_missing_in_state']} "
+            f"message_sessions_without_lifecycle_current={lifecycle_stats['message_sessions_without_lifecycle_current']} "
+            f"message_sessions_without_lifecycle_reference={lifecycle_stats['message_sessions_without_lifecycle_reference']} "
+            f"node_sessions_without_lifecycle_reference={lifecycle_stats['node_sessions_without_lifecycle_reference']} "
+            f"state_sessions_missing_in_lcm_any={lifecycle_stats['state_sessions_missing_in_lcm_any']}"
+        )
+        if lifecycle_stats.get("state_db_error"):
+            observations.append(f"lifecycle_fragmentation_state_db_error: {lifecycle_stats['state_db_error']}")
+        if _has_lifecycle_fragmentation(lifecycle_stats):
+            recommended_actions.append(
+                "inspect lifecycle fragmentation before any cleanup/repair behavior mutates state"
+            )
+            recommended_actions.append(
+                "treat this as read-only evidence; do not infer every mismatch is harmful"
+            )
+
     if clean_scan.get("protected_count"):
         observations.append(
             f"protected_sessions: skipped {clean_scan['protected_count']} currently bound session(s) from cleanup candidates"
@@ -503,6 +815,13 @@ def _doctor_text(engine) -> str:
     lines = [
         "LCM doctor",
         f"status: {doctor_status}",
+        f"plugin_name: {runtime_identity.get('plugin_name', '(unknown)')}",
+        f"plugin_version: {runtime_identity.get('plugin_version', '(unknown)')}",
+        f"plugin_path: {runtime_identity.get('plugin_path', '(unknown)')}",
+        f"module_path: {runtime_identity.get('module_path', '(unknown)')}",
+        f"plugin_git_commit: {runtime_identity.get('plugin_git_commit') or '(unavailable)'}",
+        f"plugin_git_branch: {runtime_identity.get('plugin_git_branch') or '(unavailable)'}",
+        f"plugin_git_dirty: {runtime_identity.get('plugin_git_dirty') if runtime_identity.get('plugin_git_dirty') is not None else '(unavailable)'}",
         f"database_path: {db_path}",
         f"database_exists: {_fmt_bool(db_exists)}",
         f"database_size: {_fmt_size(db_size) if db_exists else 'missing'}",
@@ -618,6 +937,80 @@ def _doctor_retention_text(engine) -> str:
     return "\n".join(lines)
 
 
+def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[str, int]:
+    """Delete cleanup candidates in one SQLite transaction.
+
+    All LCM tables live in the same SQLite database, but the store, DAG, and
+    lifecycle helpers use separate connections and commit internally. Cleanup
+    apply is destructive, so do the coordinated deletes on one connection to
+    avoid half-cleaned state if a later table delete fails.
+    """
+    conn = engine._store._conn
+    # Protect the actively-bound session id, not current_session_id. While a
+    # cron tick has rebound the engine, _session_id is the row the engine is
+    # actively writing to via lifecycle hooks; deleting it during cleanup
+    # would race with that ingest.
+    protected_session_ids = {getattr(engine, "_session_id", "")}
+    protected_session_ids = {str(s) for s in protected_session_ids if s}
+    session_ids = {str(s) for s in session_ids if s and str(s) not in protected_session_ids}
+    if not session_ids:
+        return {
+            "messages_deleted": 0,
+            "nodes_deleted": 0,
+            "lifecycle_deleted": 0,
+            "lifecycle_skipped": 0,
+        }
+
+    placeholders = ",".join("?" for _ in session_ids)
+    params = tuple(sorted(session_ids))
+    lifecycle_rows = conn.execute(
+        """
+        SELECT conversation_id, current_session_id, last_finalized_session_id
+        FROM lcm_lifecycle_state
+        """
+    ).fetchall()
+    lifecycle_delete_conversation_ids: list[str] = []
+    lifecycle_skipped = 0
+    for conversation_id, current_session_id, last_finalized_session_id in lifecycle_rows:
+        refs = {
+            str(value)
+            for value in (current_session_id, last_finalized_session_id)
+            if value
+        }
+        if not refs or not (refs & session_ids):
+            continue
+        if refs & protected_session_ids:
+            lifecycle_skipped += 1
+            continue
+        if refs <= session_ids:
+            lifecycle_delete_conversation_ids.append(str(conversation_id))
+            continue
+        lifecycle_skipped += 1
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        msg_cur = conn.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", params)
+        node_cur = conn.execute(f"DELETE FROM summary_nodes WHERE session_id IN ({placeholders})", params)
+        lifecycle_deleted = 0
+        for conversation_id in lifecycle_delete_conversation_ids:
+            cur = conn.execute(
+                "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            lifecycle_deleted += cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return {
+        "messages_deleted": msg_cur.rowcount if msg_cur.rowcount is not None else 0,
+        "nodes_deleted": node_cur.rowcount if node_cur.rowcount is not None else 0,
+        "lifecycle_deleted": lifecycle_deleted,
+        "lifecycle_skipped": lifecycle_skipped,
+    }
+
+
 def _doctor_clean_apply_text(engine) -> str:
     if not getattr(getattr(engine, "_config", None), "doctor_clean_apply_enabled", False):
         return "\n".join([
@@ -658,12 +1051,18 @@ def _doctor_clean_apply_text(engine) -> str:
         ])
 
     session_ids = {item["session_id"] for item in candidates}
-    messages_deleted = sum(engine._store.delete_session_messages(session_id) for session_id in session_ids)
-    nodes_deleted = sum(engine._dag.delete_session_nodes(session_id) for session_id in session_ids)
-    lifecycle_deleted, lifecycle_skipped = engine._lifecycle.delete_safe_rows_for_sessions(
-        session_ids,
-        protected_session_ids={getattr(engine, "_session_id", "")},
-    )
+    try:
+        deleted = _delete_clean_candidates_atomically(engine, session_ids)
+    except sqlite3.Error as exc:
+        return "\n".join([
+            "LCM doctor clean apply",
+            "status: error",
+            f"database_path: {backup['db_path']}",
+            f"backup_path: {backup['backup_path']}",
+            f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+            f"error: cleanup apply failed: {exc}",
+            "note: cleanup apply rolled back; restore from the backup if you need to inspect pre-apply state",
+        ])
 
     return "\n".join([
         "LCM doctor clean apply",
@@ -672,10 +1071,10 @@ def _doctor_clean_apply_text(engine) -> str:
         f"backup_path: {backup['backup_path']}",
         f"backup_size: {_fmt_size(int(backup['backup_size']))}",
         f"candidate_sessions: {len(candidates)}",
-        f"messages_deleted: {messages_deleted}",
-        f"nodes_deleted: {nodes_deleted}",
-        f"lifecycle_rows_deleted: {lifecycle_deleted}",
-        f"lifecycle_rows_skipped: {lifecycle_skipped}",
+        f"messages_deleted: {deleted['messages_deleted']}",
+        f"nodes_deleted: {deleted['nodes_deleted']}",
+        f"lifecycle_rows_deleted: {deleted['lifecycle_deleted']}",
+        f"lifecycle_rows_skipped: {deleted['lifecycle_skipped']}",
         "note: backup created before cleanup apply",
     ])
 
@@ -718,11 +1117,19 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
             return _doctor_text(engine)
         if len(rest) == 1 and rest[0].lower() == "clean":
             return _doctor_clean_text(engine)
+        if len(rest) == 1 and rest[0].lower() == "repair":
+            return _doctor_repair_text(engine)
+        if len(rest) == 1 and rest[0].lower() == "source":
+            return _doctor_source_text(engine)
         if len(rest) == 1 and rest[0].lower() == "retention":
             return _doctor_retention_text(engine)
         if len(rest) == 2 and rest[0].lower() == "clean" and rest[1].lower() == "apply":
             return _doctor_clean_apply_text(engine)
-        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, and `retention` as extra subcommands.")
+        if len(rest) == 2 and rest[0].lower() == "repair" and rest[1].lower() == "apply":
+            return _doctor_repair_apply_text(engine)
+        if len(rest) == 2 and rest[0].lower() == "source" and rest[1].lower() == "apply":
+            return _doctor_source_apply_text(engine)
+        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, `repair`, `repair apply`, `source`, `source apply`, and `retention` as extra subcommands.")
 
     if head == "backup":
         if rest:

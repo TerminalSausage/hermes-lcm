@@ -2,7 +2,12 @@
 
 import json
 import logging
+import re
+import sqlite3
+import threading
 import time
+from pathlib import Path
+
 import pytest
 
 import hermes_lcm.engine as lcm_engine
@@ -27,6 +32,148 @@ def engine(tmp_path):
     e.threshold_tokens = int(200000 * config.context_threshold)
     return e
 
+
+def test_lcm_tool_status_reports_lifecycle_fragmentation_summary(engine, tmp_path):
+    engine._hermes_home = str(tmp_path / "hermes_home")
+    state_db = tmp_path / "hermes_home" / "state.db"
+    state_db.parent.mkdir(parents=True, exist_ok=True)
+    state_conn = sqlite3.connect(state_db)
+    state_conn.executescript(
+        """
+        CREATE TABLE sessions (id TEXT PRIMARY KEY);
+        INSERT INTO sessions(id) VALUES ('covered-session');
+        """
+    )
+    state_conn.commit()
+    state_conn.close()
+    engine._store.append("covered-session", {"role": "user", "content": "covered"}, source="cli")
+    engine._lifecycle._conn.execute(
+        """INSERT INTO lcm_lifecycle_state
+           (conversation_id, current_session_id, last_finalized_session_id, current_frontier_store_id, last_finalized_frontier_store_id, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ("conv-stale", "missing-current", None, 0, 0, 1.0),
+    )
+    engine._lifecycle._conn.commit()
+
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert payload["lifecycle_fragmentation"]["read_only"] is True
+    assert payload["lifecycle_fragmentation"]["lifecycle_rows"] == 1
+    assert payload["lifecycle_fragmentation"]["lifecycle_current_missing_in_lcm_any"] == 1
+    assert payload["lifecycle_fragmentation"]["lifecycle_current_missing_in_state"] == 1
+
+
+def test_lcm_tool_status_includes_optional_cache_usage_metrics(engine):
+    engine.update_from_response({
+        "prompt_tokens": 1050,
+        "completion_tokens": 120,
+        "total_tokens": 1170,
+        "input_tokens": 600,
+        "output_tokens": 120,
+        "cache_read_tokens": 400,
+        "cache_write_tokens": 50,
+        "reasoning_tokens": 30,
+    })
+
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert payload["cache_metrics_available"] is True
+    assert payload["last_input_tokens"] == 600
+    assert payload["last_output_tokens"] == 120
+    assert payload["last_cache_read_tokens"] == 400
+    assert payload["last_cache_write_tokens"] == 50
+    assert payload["last_reasoning_tokens"] == 30
+    assert payload["cache_read_ratio"] == 0.381
+    assert payload["runtime_identity"]["plugin_name"] == "hermes-lcm"
+    assert payload["runtime_identity"]["database_path_source"] == "config.database_path"
+
+
+def test_lcm_tool_status_forwards_filter_config_to_agent_surface(tmp_path, monkeypatch):
+    from hermes_lcm import message_patterns as message_patterns_mod
+
+    monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+
+    config = LCMConfig(
+        database_path=str(tmp_path / "tool-status-filter-config.db"),
+        ignore_session_patterns=["cron:*"],
+        stateless_session_patterns=["debug:*"],
+        ignore_message_patterns=["^Cronjob Response:"],
+        ignore_session_patterns_source="env",
+        stateless_session_patterns_source="env",
+        ignore_message_patterns_source="env",
+    )
+    engine = LCMEngine(config=config)
+    engine.on_session_start("chat-1", platform="telegram", context_length=200000)
+    engine._ingest_messages([{"role": "user", "content": "Cronjob Response: heartbeat"}])
+
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert payload["session_filters"] == {
+        "ignored": False,
+        "stateless": False,
+        "ignore_session_patterns": ["cron:*"],
+        "ignore_session_patterns_source": "env",
+        "stateless_session_patterns": ["debug:*"],
+        "stateless_session_patterns_source": "env",
+        "ignore_message_patterns": ["^Cronjob Response:"],
+        "ignore_message_patterns_source": "env",
+        "ignored_message_count": 1,
+        "side_channel_active": False,
+    }
+
+
+def test_lcm_tool_status_reports_runtime_identity_before_session_binding(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "unbound-tool-status.db"))
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes-home"))
+
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert payload["error"] == "No active session"
+    assert payload["runtime_identity"]["plugin_name"] == "hermes-lcm"
+    assert payload["runtime_identity"]["session_bound"] is False
+    assert payload["runtime_identity"]["database_path_source"] == "config.database_path"
+
+
+
+def test_get_status_exposes_runtime_identity_for_loaded_plugin_tree(tmp_path):
+    db_path = tmp_path / "identity.db"
+    hermes_home = tmp_path / "hermes-home"
+    config = LCMConfig(database_path=str(db_path))
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        context_length=200000,
+        conversation_id="telegram:chat-1",
+    )
+
+    status = engine.get_status()
+    identity = status["runtime_identity"]
+    repo_root = Path(__file__).resolve().parent.parent
+
+    assert identity["engine"] == "lcm"
+    assert identity["plugin_name"] == "hermes-lcm"
+    assert identity["plugin_version"] == "0.9.2"
+    assert Path(identity["plugin_path"]) == repo_root
+    assert Path(identity["module_path"]).name == "engine.py"
+    assert Path(identity["database_path"]) == db_path
+    assert identity["database_path_source"] == "config.database_path"
+    assert identity["hermes_home"] == str(hermes_home)
+    assert identity["session_id"] == "telegram:chat-1:session-1"
+    assert identity["session_platform"] == "telegram"
+    assert identity["conversation_id"] == "telegram:chat-1"
+    assert identity["lifecycle_current_session_id"] == "telegram:chat-1:session-1"
+    assert identity["lifecycle_last_finalized_session_id"] == ""
+
+
+
+
+def test_lcm_doctor_json_includes_runtime_identity(engine):
+    payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+    assert payload["runtime_identity"]["plugin_name"] == "hermes-lcm"
+    assert payload["runtime_identity"]["plugin_version"] == "0.9.2"
+    assert "plugin_git_commit" in payload["runtime_identity"]
 
 class TestEscalationStripReasoning:
     """Regression tests for thinking-model reasoning-tag stripping in
@@ -232,6 +379,7 @@ class TestEngineABC:
         assert "lcm_grep" in names
         assert "lcm_describe" in names
         assert "lcm_expand" in names
+        assert "lcm_load_session" in names
         assert "lcm_status" in names
         assert "lcm_doctor" in names
         assert "lcm_expand_query" in names
@@ -239,12 +387,33 @@ class TestEngineABC:
         grep_schema = next(s for s in schemas if s["name"] == "lcm_grep")
         grep_props = grep_schema["parameters"]["properties"]
         assert "session_scope" in grep_props
+        assert grep_props["session_scope"]["enum"] == ["current", "all", "session"]
+        assert "session_id" in grep_props
+        assert "session_scope='session'" in grep_props["session_id"]["description"]
+        # role/time_from/time_to filters are intentionally absent in this
+        # version; they need to be pushed into the search layer before being
+        # exposed again. See follow-up issue tracking that work.
+        assert "role" not in grep_props
+        assert "time_from" not in grep_props
+        assert "time_to" not in grep_props
         assert "source" in grep_props
         assert "descendant source lineage" in grep_props["source"]["description"]
         assert "unknown" in grep_props["source"]["description"]
-        assert "current session" in grep_schema["description"].lower()
+        # The default scope still steers callers to the active session.
+        description_lower = grep_schema["description"].lower()
+        assert (
+            "current-session" in description_lower
+            or "current session" in description_lower
+            or "active session" in description_lower
+        )
         assert "session_search" in grep_schema["description"]
-        assert "session_search" in grep_props["session_scope"]["description"]
+        # The schema now documents the broader scopes — assert by enumerating them in the
+        # session_scope description rather than enforcing the legacy current-only wording.
+        scope_description = grep_props["session_scope"]["description"]
+        assert "all" in scope_description and "session" in scope_description and "current" in scope_description
+        assert "session_search" in scope_description
+        # Cross-session search is positioned as plugin-local archive recovery, not memory.
+        assert "archive" in grep_schema["description"].lower() or "plugin-local" in grep_schema["description"].lower()
 
         describe_schema = next(s for s in schemas if s["name"] == "lcm_describe")
         expand_schema = next(s for s in schemas if s["name"] == "lcm_expand")
@@ -252,10 +421,51 @@ class TestEngineABC:
 
         assert "current session" in describe_schema["description"].lower()
         assert "session_search" in describe_schema["description"]
-        assert "current session" in expand_schema["description"].lower()
+        # lcm_expand picked up a third mode (store_id); its description must surface that.
+        assert "store_id" in expand_schema["description"]
         assert "session_search" in expand_schema["description"]
+        expand_props = expand_schema["parameters"]["properties"]
+        assert "source_offset" in expand_props
+        assert "source_limit" in expand_props
+        assert "content_offset" in expand_props
+        assert "store_id" in expand_props
+        assert "across sessions" in expand_props["store_id"]["description"].lower() or "cross-session" in expand_props["store_id"]["description"].lower()
+        assert "pagination" in expand_props["source_offset"]["description"].lower()
+        load_schema = next(s for s in schemas if s["name"] == "lcm_load_session")
+        load_props = load_schema["parameters"]["properties"]
+        assert load_schema["parameters"]["required"] == ["session_id"]
+        assert "ordered raw-message transcript" in load_schema["description"]
+        assert "after_store_id" in load_props
+        assert "max_content_chars" in load_props
+        assert "roles" in load_props
+        assert "time_from" in load_props
+        assert "time_to" in load_props
         assert "current session" in expand_query_schema["description"].lower()
         assert "session_search" in expand_query_schema["description"]
+        expand_query_props = expand_query_schema["parameters"]["properties"]
+        assert "context_max_tokens" in expand_query_props
+        assert "fresh context budget" in expand_query_props["context_max_tokens"]["description"]
+
+    def test_readme_documents_session_scope_contract(self):
+        readme = Path(__file__).resolve().parents[1].joinpath("README.md").read_text()
+        # cross-session opt-in is now documented as bounded archive recovery
+        assert "session_scope='all'" in readme
+        assert "session_scope='session'" in readme
+        assert "current-session recall" in readme
+        assert "session_search" in readme
+        # The reframed positioning steers callers away from a memory-system
+        # reading and toward bounded archive recovery over rows already in lcm.db.
+        assert "archive" in readme.lower() or "externally backfilled" in readme.lower()
+        # No implied importer language: anchor the use case on rows already in
+        # lcm.db, not on an official OpenClaw/lossless-claw importer.
+        assert "imported from OpenClaw" not in readme
+        assert "imported from lossless-claw" not in readme
+        assert "Lossless raw recovery contract" in readme
+        assert "lcm_load_session" in readme
+        assert "after_store_id" in readme
+        assert "source_offset" in readme
+        assert "content_offset" in readme
+        assert "LCM_EXPANSION_CONTEXT_TOKENS" in readme
 
     def test_should_compress(self, engine):
         assert not engine.should_compress(1000)
@@ -282,16 +492,38 @@ class TestEngineABC:
 
     def test_session_reset(self, engine):
         engine.compression_count = 5
-        engine.last_prompt_tokens = 9999
+        engine.update_from_response({
+            "prompt_tokens": 1050,
+            "completion_tokens": 120,
+            "total_tokens": 1170,
+            "input_tokens": 600,
+            "output_tokens": 120,
+            "cache_read_tokens": 400,
+            "cache_write_tokens": 50,
+            "reasoning_tokens": 30,
+        })
         engine.on_session_reset()
         assert engine.compression_count == 0
         assert engine.last_prompt_tokens == 0
+        assert engine.last_input_tokens == 0
+        assert engine.last_output_tokens == 0
+        assert engine.last_cache_read_tokens == 0
+        assert engine.last_cache_write_tokens == 0
+        assert engine.last_reasoning_tokens == 0
+        assert engine.cache_metrics_available is False
 
     def test_on_session_start_resets_session_scoped_runtime_when_binding_new_session(self, engine):
         engine.compression_count = 5
-        engine.last_prompt_tokens = 9999
-        engine.last_completion_tokens = 333
-        engine.last_total_tokens = 10332
+        engine.update_from_response({
+            "prompt_tokens": 9999,
+            "completion_tokens": 333,
+            "total_tokens": 10332,
+            "input_tokens": 9000,
+            "output_tokens": 333,
+            "cache_read_tokens": 777,
+            "cache_write_tokens": 88,
+            "reasoning_tokens": 44,
+        })
         engine._last_compacted_store_id = 42
         engine._ingest_cursor = 7
         engine._context_probed = True
@@ -303,10 +535,634 @@ class TestEngineABC:
         assert engine.last_prompt_tokens == 0
         assert engine.last_completion_tokens == 0
         assert engine.last_total_tokens == 0
+        assert engine.last_input_tokens == 0
+        assert engine.last_output_tokens == 0
+        assert engine.last_cache_read_tokens == 0
+        assert engine.last_cache_write_tokens == 0
+        assert engine.last_reasoning_tokens == 0
+        assert engine.cache_metrics_available is False
         assert engine._last_compacted_store_id == 0
         assert engine._ingest_cursor == 0
         assert engine._context_probed is False
         assert engine._context_probe_persistable is False
+
+    def test_existing_session_restart_reconciles_cursor_before_ingest(self, tmp_path):
+        db_path = tmp_path / "restart-reconcile.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "restart-session",
+            platform="cli",
+            conversation_id="restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "question before restart"},
+            {"role": "assistant", "content": "answer before restart"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._lifecycle.advance_frontier(
+            "restart-conversation",
+            "restart-session",
+            before_restart._store.get_session_count("restart-session"),
+        )
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "restart-session",
+            platform="cli",
+            conversation_id="restart-conversation",
+            context_length=200000,
+        )
+        active_context = persisted_messages + [
+            {"role": "assistant", "content": "calling terminal", "tool_calls": [{"id": "call_1", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "terminal output after restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("restart-session")
+        assert [row["role"] for row in rows] == [
+            "system",
+            "user",
+            "assistant",
+            "assistant",
+            "tool",
+        ]
+        assert rows[-1]["content"] == "terminal output after restart"
+        assert rows[-1]["tool_call_id"] == "call_1"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_compacted_session_restart_skips_synthetic_context_but_persists_new_tool(self, tmp_path):
+        db_path = tmp_path / "restart-compacted.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "compacted-session",
+            platform="cli",
+            conversation_id="compacted-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "fresh user tail"},
+            {"role": "assistant", "content": "fresh assistant tail"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "compacted-session",
+            platform="cli",
+            conversation_id="compacted-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {
+                "role": "assistant",
+                "content": "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
+            },
+            {"role": "user", "content": "fresh user tail"},
+            {"role": "assistant", "content": "fresh assistant tail"},
+            {"role": "assistant", "content": "calling terminal", "tool_calls": [{"id": "call_2", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "tool output after compacted restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("compacted-session")
+        assert [row["role"] for row in rows] == [
+            "system",
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+            "assistant",
+            "tool",
+        ]
+        assert rows[-4]["content"] == "fresh user tail"
+        assert rows[-3]["content"] == "fresh assistant tail"
+        assert rows[-1]["content"] == "tool output after compacted restart"
+        assert rows[-1]["tool_call_id"] == "call_2"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_large_session_restart_reconciles_beyond_short_tail_window(self, tmp_path):
+        db_path = tmp_path / "restart-large.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "large-restart-session",
+            platform="cli",
+            conversation_id="large-restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [{"role": "system", "content": "You are concise."}]
+        persisted_messages.extend(
+            {"role": "user", "content": f"message before restart {i}"}
+            for i in range(5000)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "large-restart-session",
+            platform="cli",
+            conversation_id="large-restart-conversation",
+            context_length=200000,
+        )
+        active_context = persisted_messages + [
+            {"role": "assistant", "content": "calling terminal", "tool_calls": [{"id": "call_large", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_large", "content": "large-session tool output after restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "large-restart-session",
+            limit=len(active_context) + 1,
+        )
+        assert len(rows) == len(active_context)
+        assert rows[-1]["role"] == "tool"
+        assert rows[-1]["tool_call_id"] == "call_large"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_does_not_skip_repeated_non_tail_messages(self, tmp_path):
+        db_path = tmp_path / "restart-repeated-non-tail.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "repeat-restart-session",
+            platform="cli",
+            conversation_id="repeat-restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "repeatable request"},
+            {"role": "assistant", "content": "repeatable answer"},
+        ]
+        persisted_messages.extend(
+            {"role": "user", "content": f"tail message before restart {i}"}
+            for i in range(120)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "repeat-restart-session",
+            platform="cli",
+            conversation_id="repeat-restart-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {"role": "user", "content": "repeatable request"},
+            {"role": "assistant", "content": "repeatable answer"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "repeat-restart-session",
+            limit=len(persisted_messages) + 3,
+        )
+        assert len(rows) == len(persisted_messages) + 2
+        assert rows[-2]["role"] == "user"
+        assert rows[-2]["content"] == "repeatable request"
+        assert rows[-1]["role"] == "assistant"
+        assert rows[-1]["content"] == "repeatable answer"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_reconciles_full_replay_without_system_prompt(self, tmp_path):
+        db_path = tmp_path / "restart-full-replay-no-system.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "full-replay-no-system-session",
+            platform="cli",
+            conversation_id="full-replay-no-system-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "full-replay-no-system-session",
+            platform="cli",
+            conversation_id="full-replay-no-system-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            *persisted_messages,
+            {"role": "user", "content": "new question after restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "full-replay-no-system-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages) + 1
+        assert [row["content"] for row in rows] == [
+            "first question",
+            "first answer",
+            "new question after restart",
+        ]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_reconciles_complete_replay_without_system_prompt(self, tmp_path):
+        db_path = tmp_path / "restart-complete-replay-no-system.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "complete-replay-no-system-session",
+            platform="cli",
+            conversation_id="complete-replay-no-system-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "complete-replay-no-system-session",
+            platform="cli",
+            conversation_id="complete-replay-no-system-conversation",
+            context_length=200000,
+        )
+
+        after_restart._ingest_messages(list(persisted_messages))
+
+        rows = after_restart._store.get_session_messages(
+            "complete-replay-no-system-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages)
+        assert [row["content"] for row in rows] == ["first question", "first answer"]
+        assert after_restart._ingest_cursor == len(persisted_messages)
+
+    def test_existing_session_restart_persists_delta_message_matching_store_tail(self, tmp_path):
+        db_path = tmp_path / "restart-repeated-tail-delta.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "initial question"},
+            {"role": "assistant", "content": "initial answer"},
+            {"role": "user", "content": "retry"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        active_context = [{"role": "user", "content": "retry"}]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "repeat-tail-delta-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages) + 1
+        assert [row["content"] for row in rows[-2:]] == ["retry", "retry"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_single_delta_message_matching_store_tail(self, tmp_path):
+        db_path = tmp_path / "restart-single-repeated-tail-delta.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "single-repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="single-repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [{"role": "user", "content": "retry"}]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "single-repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="single-repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        active_context = [{"role": "user", "content": "retry"}]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "single-repeat-tail-delta-session",
+            limit=2,
+        )
+        assert len(rows) == 2
+        assert [row["content"] for row in rows] == ["retry", "retry"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_single_delta_message_matching_store_tail_with_followup(self, tmp_path):
+        db_path = tmp_path / "restart-single-repeated-tail-followup.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "single-repeat-tail-followup-session",
+            platform="cli",
+            conversation_id="single-repeat-tail-followup-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [{"role": "user", "content": "retry"}]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "single-repeat-tail-followup-session",
+            platform="cli",
+            conversation_id="single-repeat-tail-followup-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {"role": "user", "content": "retry"},
+            {"role": "assistant", "content": "next answer"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "single-repeat-tail-followup-session",
+            limit=3,
+        )
+        assert len(rows) == 3
+        assert [row["content"] for row in rows] == ["retry", "retry", "next answer"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail(self, tmp_path):
+        db_path = tmp_path / "restart-scaffolded-repeated-tail-delta.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "scaffold-repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="scaffold-repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "initial question"},
+            {"role": "assistant", "content": "initial answer"},
+            {"role": "user", "content": "retry"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "scaffold-repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="scaffold-repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {"role": "user", "content": "retry"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "scaffold-repeat-tail-delta-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages) + 1
+        assert [row["content"] for row in rows[-2:]] == ["retry", "retry"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail_with_followup(self, tmp_path):
+        db_path = tmp_path / "restart-scaffolded-repeated-tail-followup.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "scaffold-repeat-tail-followup-session",
+            platform="cli",
+            conversation_id="scaffold-repeat-tail-followup-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "initial question"},
+            {"role": "assistant", "content": "initial answer"},
+            {"role": "user", "content": "retry"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "scaffold-repeat-tail-followup-session",
+            platform="cli",
+            conversation_id="scaffold-repeat-tail-followup-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {"role": "user", "content": "retry"},
+            {"role": "assistant", "content": "next answer"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "scaffold-repeat-tail-followup-session",
+            limit=len(persisted_messages) + 2,
+        )
+        assert len(rows) == len(persisted_messages) + 2
+        assert [row["content"] for row in rows[-3:]] == ["retry", "retry", "next answer"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_new_system_message(self, tmp_path):
+        db_path = tmp_path / "restart-new-system.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "system-restart-session",
+            platform="cli",
+            conversation_id="system-restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "tail before restart"},
+            {"role": "assistant", "content": "answer before restart"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "system-restart-session",
+            platform="cli",
+            conversation_id="system-restart-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {"role": "system", "content": "new policy injected after restart"},
+            {"role": "user", "content": "new user after restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "system-restart-session",
+            limit=len(persisted_messages) + 2,
+        )
+        assert len(rows) == len(persisted_messages) + 2
+        assert rows[-2]["role"] == "system"
+        assert rows[-2]["content"] == "new policy injected after restart"
+        assert rows[-1]["role"] == "user"
+        assert rows[-1]["content"] == "new user after restart"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_new_system_message_that_mentions_lcm(self, tmp_path):
+        db_path = tmp_path / "restart-new-system-lcm-phrase.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "system-lcm-phrase-session",
+            platform="cli",
+            conversation_id="system-lcm-phrase-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "tail before restart"},
+            {"role": "assistant", "content": "answer before restart"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "system-lcm-phrase-session",
+            platform="cli",
+            conversation_id="system-lcm-phrase-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "Policy update: Lossless Context Management (LCM) must be audited during this run.",
+            },
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "system-lcm-phrase-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages) + 1
+        assert rows[-1]["role"] == "system"
+        assert rows[-1]["content"] == "Policy update: Lossless Context Management (LCM) must be audited during this run."
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_skips_exact_lcm_system_scaffold(self, tmp_path):
+        db_path = tmp_path / "restart-system-scaffold.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "system-scaffold-session",
+            platform="cli",
+            conversation_id="system-scaffold-conversation",
+            context_length=200000,
+        )
+        before_restart._ingest_messages([
+            {"role": "user", "content": "tail before restart"},
+        ])
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "system-scaffold-session",
+            platform="cli",
+            conversation_id="system-scaffold-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("system-scaffold-session")
+        assert len(rows) == 1
+        assert rows[0]["content"] == "tail before restart"
+        assert after_restart._ingest_cursor == len(active_context)
 
     def test_get_status(self, engine):
         status = engine.get_status()
@@ -438,6 +1294,768 @@ class TestSessionFiltering:
         assert instance._dag.get_session_nodes("debug") == []
         assert instance.compression_count == 0
 
+    def test_ignored_session_does_not_rebind_foreground_view(self, tmp_path):
+        """A cron-style ignored session arriving while a foreground session is
+        bound must not steal the engine's foreground "current session" view.
+        The engine continues to rebind ``_session_id`` so cron's own compress
+        / handle_tool_call calls correctly short-circuit on
+        ``_session_ignored=True``, but ``current_session_id`` (the property
+        every LCM tool reads) keeps pointing at the foreground binding.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_no_rebind_ignored.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "20260506_201605_75a4c6",
+            platform="telegram",
+            conversation_id="telegram-conversation",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "20260506_201605_75a4c6",
+            {"role": "user", "content": "hi from telegram"},
+            token_estimate=4,
+            source="telegram",
+        )
+
+        instance.on_session_start(
+            "cron_eee06bdbb09b_20260506_210051",
+            platform="cron",
+            conversation_id="cron-conversation",
+            context_length=200_000,
+        )
+
+        # Bound state continues to follow the side channel so cron's own
+        # compress and handle_tool_call calls correctly short-circuit on
+        # _session_ignored=True. This is the pre-fix behavior and must be
+        # preserved -- without it, cron messages would ingest into the
+        # foreground store via _ingest_messages.
+        assert instance._session_id == "cron_eee06bdbb09b_20260506_210051"
+        assert instance._session_ignored is True
+
+        # Foreground view stays stable across the rebind. Tools that read
+        # current_session_id (lcm_status, lcm_grep default scope, etc.)
+        # continue to see the operator's real conversation.
+        assert instance._foreground_session_id == "20260506_201605_75a4c6"
+        assert instance.current_session_id == "20260506_201605_75a4c6"
+        assert instance.current_session_platform == "telegram"
+        assert instance.current_conversation_id == "telegram-conversation"
+
+    def test_ignored_session_compress_does_not_leak_into_foreground_store(self, tmp_path):
+        """Regression: the foreground view must not come at the cost of
+        leaking the side channel's transcript into the foreground store. With
+        the bound binding still pointing at the cron session,
+        ``_session_ignored=True`` correctly gates ingest so cron's compress
+        and should_compress_preflight calls leave the foreground row count
+        untouched.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_no_leak_ignored.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "telegram-foreground",
+            platform="telegram",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "telegram-foreground",
+            {"role": "user", "content": "telegram-1"},
+            token_estimate=2,
+            source="telegram",
+        )
+        instance.on_session_start(
+            "cron_xxx",
+            platform="cron",
+            context_length=200_000,
+        )
+
+        cron_messages = [
+            {"role": "system", "content": "sys-cron"},
+            {"role": "user", "content": "cron-1"},
+            {"role": "assistant", "content": "cron-2"},
+            {"role": "user", "content": "cron-3"},
+        ]
+        instance.should_compress_preflight(cron_messages)
+        instance.compress(cron_messages)
+
+        assert instance._store.get_session_count("telegram-foreground") == 1
+        assert instance._store.get_session_count("cron_xxx") == 0
+
+    def test_lcm_status_stays_on_foreground_after_cron_tick(self, tmp_path):
+        """End-to-end: lcm_status must still report the Telegram session id
+        and its row counts after a cron-style ignored session has rebound the
+        engine. The bound side channel surfaces only via the diagnostic
+        ``side_channel_in_flight`` / ``bound_session_id`` keys.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_status_after_cron.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "20260506_201605_75a4c6",
+            platform="telegram",
+            conversation_id="telegram-conversation",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "20260506_201605_75a4c6",
+            {"role": "user", "content": "telegram message"},
+            token_estimate=3,
+            source="telegram",
+        )
+
+        instance.on_session_start(
+            "cron_eee06bdbb09b_20260506_210051",
+            platform="cron",
+            conversation_id="cron-conversation",
+            context_length=200_000,
+        )
+
+        payload = json.loads(lcm_tools.lcm_status({}, engine=instance))
+
+        assert payload["session_id"] == "20260506_201605_75a4c6"
+        assert payload["store"]["messages"] == 1
+        assert payload["source_lineage"]["messages_total"] == 1
+        assert payload["runtime_identity"]["session_id"] == "20260506_201605_75a4c6"
+        assert payload["runtime_identity"]["session_platform"] == "telegram"
+        assert payload["runtime_identity"]["conversation_id"] == "telegram-conversation"
+        assert payload["runtime_identity"]["bound_session_id"] == "cron_eee06bdbb09b_20260506_210051"
+        assert payload["runtime_identity"]["bound_session_platform"] == "cron"
+        assert payload["runtime_identity"]["bound_conversation_id"] == "cron-conversation"
+        assert payload["lifecycle"]["conversation_id"] == "telegram-conversation"
+        assert payload["lifecycle"]["current_session_id"] == "20260506_201605_75a4c6"
+        assert payload["session_filters"]["ignored"] is False
+        assert payload["session_filters"]["stateless"] is False
+        assert payload["session_filters"]["side_channel_active"] is True
+        assert (
+            payload["session_filters"]["side_channel_session_id"]
+            == "cron_eee06bdbb09b_20260506_210051"
+        )
+
+    def test_lcm_status_reports_bound_session_when_no_foreground_yet(self, tmp_path):
+        """A fresh engine that only ever binds an ignored session must still
+        report something usable via lcm_status, with the bound session's
+        ignore flag intact so operators can see why the row count is zero.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_first_bind_ignored.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "cron_first_run_20260506_210051",
+            platform="cron",
+            context_length=200_000,
+        )
+
+        assert instance._session_id == "cron_first_run_20260506_210051"
+        assert instance._session_ignored is True
+        assert instance._foreground_session_id == ""
+        assert instance.current_session_id == "cron_first_run_20260506_210051"
+
+        payload = json.loads(lcm_tools.lcm_status({}, engine=instance))
+        assert payload["session_id"] == "cron_first_run_20260506_210051"
+        assert payload["session_filters"]["ignored"] is True
+        assert payload["session_filters"]["side_channel_active"] is False
+        assert "side_channel_session_id" not in payload["session_filters"]
+
+    def test_stateless_session_does_not_rebind_foreground_view(self, tmp_path):
+        """The same protection applies to stateless side-channel sessions: a
+        ``debug:*``-style session must not clobber the foreground
+        ``current_session_id`` view, even though it does claim ``_session_id``
+        for its own lifecycle gating.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_no_rebind_stateless.db"),
+            stateless_session_patterns=["debug:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "telegram-foreground",
+            platform="telegram",
+            context_length=200_000,
+        )
+
+        instance.on_session_start(
+            "debug:probe-1",
+            platform="debug",
+            context_length=200_000,
+        )
+
+        assert instance._session_id == "debug:probe-1"
+        assert instance._session_stateless is True
+        assert instance._foreground_session_id == "telegram-foreground"
+        assert instance.current_session_id == "telegram-foreground"
+        assert instance.current_session_platform == "telegram"
+
+    def test_lcm_command_status_text_is_consistent_with_lcm_status_during_cron_tick(self, tmp_path):
+        """The /lcm command's _status_text and the lcm_status tool must agree
+        on session_id, session_ignored, and session_stateless during a cron
+        tick. Without this, an operator reading /lcm status sees session_id
+        for the foreground but ignored=true for the side channel.
+        """
+        from hermes_lcm.command import _status_text
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_command_consistency.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "telegram-foreground",
+            platform="telegram",
+            conversation_id="telegram-conversation",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "telegram-foreground",
+            {"role": "user", "content": "telegram row"},
+            token_estimate=2,
+            source="telegram",
+        )
+        instance.on_session_start(
+            "cron_xxx",
+            platform="cron",
+            conversation_id="cron-conversation",
+            context_length=200_000,
+        )
+
+        text = _status_text(instance)
+        assert "session_id: telegram-foreground" in text
+        assert "conversation_id: telegram-conversation" in text
+        assert "lifecycle_current_session_id: telegram-foreground" in text
+        assert "source_messages_total: 1" in text
+        assert "store_messages: 1" in text
+        assert "session_ignored: no" in text
+        assert "session_stateless: no" in text
+        assert "side_channel_active: yes" in text
+
+    def test_lcm_doctor_retention_targets_foreground_during_cron_tick(self, tmp_path):
+        """The /lcm doctor retention surface must report on the foreground
+        session, not the cron-style side channel that briefly owns
+        engine._session_id. The SQL filter and the row aggregation both need
+        to follow current_session_id.
+        """
+        from hermes_lcm.command import _scan_retention_candidates
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_retention_during_cron.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("telegram-foreground", platform="telegram", context_length=200_000)
+        instance._store.append(
+            "telegram-foreground",
+            {"role": "user", "content": "telegram retention test"},
+            token_estimate=3,
+            source="telegram",
+        )
+        instance.on_session_start("cron_xxx", platform="cron", context_length=200_000)
+
+        scan = _scan_retention_candidates(instance)
+        assert scan["error"] is None
+        # Foreground row surfaces; cron's empty session is not the scan
+        # target. protected is False because the bound id is cron, not the
+        # row we are reporting on.
+        assert scan["sessions_analyzed"] == 1
+        assert scan["sessions"][0]["session_id"] == "telegram-foreground"
+        assert scan["sessions"][0]["protected"] is False
+
+    def test_foreground_view_advances_when_a_real_foreground_arrives(self, tmp_path):
+        """``_foreground_session_id`` advances forward through real foreground
+        bindings (e.g., compression rollovers) but is never set to an ignored
+        or stateless session id. This is the rebind path the bug fix must not
+        regress.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_foreground_advances.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "telegram-1",
+            platform="telegram",
+            context_length=200_000,
+        )
+        assert instance._foreground_session_id == "telegram-1"
+
+        instance.on_session_start(
+            "cron_xxx",
+            platform="cron",
+            context_length=200_000,
+        )
+        assert instance._foreground_session_id == "telegram-1"
+
+        instance.on_session_start(
+            "telegram-2",
+            platform="telegram",
+            context_length=200_000,
+        )
+        assert instance._foreground_session_id == "telegram-2"
+        assert instance.current_session_id == "telegram-2"
+
+
+class _FakeTimeoutPattern:
+    def __init__(self, pattern):
+        self.pattern = pattern
+        self._compiled = re.compile(pattern)
+
+    def search(self, text, *, timeout=None):
+        assert timeout is not None
+        return self._compiled.search(text)
+
+
+class _FakeTimeoutRegexEngine:
+    error = re.error
+
+    @staticmethod
+    def compile(pattern):
+        return _FakeTimeoutPattern(pattern)
+
+
+class TestMessageFiltering:
+    @pytest.fixture(autouse=True)
+    def _timeout_capable_regex_engine(self, monkeypatch):
+        from hermes_lcm import message_patterns as message_patterns_mod
+
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+
+    def _make_engine(self, tmp_path, db_name, **config_kwargs):
+        config = LCMConfig(
+            database_path=str(tmp_path / db_name),
+            **config_kwargs,
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("user-123", platform="telegram", context_length=1000)
+        return engine
+
+    def test_no_patterns_means_no_filtering(self, tmp_path):
+        engine = self._make_engine(tmp_path, "lcm_msg_unset.db")
+        messages = [
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "normal text"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 3
+        assert engine._ignored_message_count == 0
+
+    def test_anchored_prefix_drops_matching_message(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_anchor.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+            ignore_message_patterns_source="env",
+        )
+        messages = [
+            {"role": "user", "content": "Cronjob Response: hermie heartbeat\n(job_id: abc)"},
+            {"role": "user", "content": "can you check the database for me?"},
+            {"role": "assistant", "content": "Sure, looking now."},
+        ]
+        engine._ingest_messages(messages)
+
+        stored = engine._store.get_session_messages("user-123")
+        stored_contents = [row["content"] for row in stored]
+        assert len(stored) == 2
+        assert "Cronjob Response:" not in "\n".join(stored_contents)
+        assert "can you check the database for me?" in stored_contents
+        assert engine._ignored_message_count == 1
+
+    def test_triple_bracket_wrapper_variant_dropped(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_triple.db",
+            ignore_message_patterns=["^>>>Cronjob Response<<<:"],
+        )
+        messages = [
+            {"role": "user", "content": ">>>Cronjob Response<<<: heartbeat"},
+            {"role": "user", "content": "regular question"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 1
+
+    def test_inline_flag_pattern_drops_both_wrapper_variants(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_inline.db",
+            ignore_message_patterns=[r"(?is)^\s*(>>>\s*)?Cronjob Response"],
+        )
+        messages = [
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "  >>> Cronjob Response: heartbeat"},
+            {"role": "user", "content": "non-matching content"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 2
+
+    def test_active_pattern_does_not_regress_normal_messages(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_normal.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {"role": "user", "content": "Can you check the database for me?"},
+            {"role": "assistant", "content": "Looking now."},
+        ]
+        engine._ingest_messages(messages)
+        stored_contents = [
+            row["content"] for row in engine._store.get_session_messages("user-123")
+        ]
+        assert stored_contents == [
+            "Can you check the database for me?",
+            "Looking now.",
+        ]
+        assert engine._ignored_message_count == 0
+
+    def test_anchored_pattern_matches_multimodal_text_part_content(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_anchored.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        multimodal = {
+            "role": "user",
+            "content": [{"type": "text", "text": "Cronjob Response: heartbeat"}],
+        }
+        engine._ingest_messages([multimodal])
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 1
+
+    def test_anchored_pattern_matches_structured_text_value_parts(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_text_value.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": {"value": "Cronjob Response: nested text"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "content": "Cronjob Response: content field"}
+                ],
+            },
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 2
+
+    def test_structured_content_without_text_parts_falls_back_to_normalized_json(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_json_fallback.db",
+            ignore_message_patterns=["file_123"],
+        )
+        multimodal = {
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file_123"}],
+        }
+        engine._ingest_messages([multimodal])
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 1
+
+    def test_unanchored_pattern_matches_multimodal_content(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_substr.db",
+            ignore_message_patterns=["Cronjob Response:"],
+        )
+        multimodal = {
+            "role": "user",
+            "content": [{"type": "text", "text": "Cronjob Response: heartbeat"}],
+        }
+        engine._ingest_messages([multimodal])
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 1
+
+    def test_filter_is_role_agnostic(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_roles.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {"role": "tool", "content": "Cronjob Response: tool-emitted"},
+            {"role": "assistant", "content": "Cronjob Response: assistant-quoted"},
+            {"role": "user", "content": "user-normal"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 2
+
+    def test_invalid_regex_warned_and_surviving_pattern_still_filters(self, tmp_path, caplog):
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            engine = self._make_engine(
+                tmp_path, "lcm_msg_invalid.db",
+                ignore_message_patterns=["[unclosed", "^Cronjob Response:"],
+            )
+
+        assert "skipping invalid regex" in caplog.text
+        assert "[unclosed" in caplog.text
+
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "normal text"},
+        ])
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 1
+
+    def test_session_filter_and_message_filter_coexist(self, tmp_path):
+        # Session-level filter blocks all writes for a matched session,
+        # taking precedence over per-message filtering.
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_both_filters.db"),
+            ignore_session_patterns=["cron:*"],
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("cron_123", platform="cron", context_length=1000)
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "anything"},
+        ])
+        assert engine._store.get_session_count("cron_123") == 0
+        # Counter does not increment for ignored sessions: ingest short-circuits before the message filter runs.
+        assert engine._ignored_message_count == 0
+
+        # On a normal-platform session, only the message filter applies.
+        engine.on_session_start("user-123", platform="telegram", context_length=1000)
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "regular conversation"},
+        ])
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 1
+
+    def test_missing_regex_dependency_leaves_messages_unfiltered(self, tmp_path, monkeypatch, caplog):
+        from hermes_lcm import message_patterns as message_patterns_mod
+
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", None)
+        monkeypatch.setattr(message_patterns_mod, "_MISSING_REGEX_WARNING_EMITTED", False)
+
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            engine = self._make_engine(
+                tmp_path,
+                "lcm_msg_no_regex.db",
+                ignore_message_patterns=[r"(a+)+$"],
+                ignore_message_patterns_source="env",
+            )
+
+        engine._ingest_messages([
+            {"role": "user", "content": "a" * 30 + "!"},
+        ])
+
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 0
+        assert "regex" in caplog.text
+        assert "disabled" in caplog.text
+
+    def test_status_surfaces_message_pattern_keys(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_status.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+            ignore_message_patterns_source="env",
+        )
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+        ])
+        status = engine.get_status()
+        assert status["ignore_message_patterns"] == ["^Cronjob Response:"]
+        assert status["ignore_message_patterns_source"] == "env"
+        assert status["ignored_message_count"] == 1
+        # Existing session-pattern keys are still surfaced unchanged.
+        assert status["ignore_session_patterns"] == []
+        assert status["ignore_session_patterns_source"] == "default"
+
+    def test_diagnostic_log_emits_once_per_engine(self, tmp_path, caplog):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_msg_log_once.db"),
+            ignore_message_patterns=["^Cronjob Response:"],
+            ignore_message_patterns_source="env",
+        )
+        engine = LCMEngine(config=config)
+
+        with caplog.at_level("INFO", logger="hermes_lcm.engine"):
+            engine.on_session_start("user-123", platform="telegram", context_length=1000)
+            engine.on_session_start("user-456", platform="telegram", context_length=1000)
+
+        assert caplog.text.count("LCM ignore_message_patterns from env: ^Cronjob Response:") == 1
+
+    def test_stateless_session_skips_message_filter_entirely(self, tmp_path):
+        # Stateless sessions short-circuit ingest before the message filter runs,
+        # mirroring the ignored-session contract. The counter must not increment
+        # for a stateless session even when patterns would otherwise match.
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_stateless_msg.db"),
+            stateless_session_patterns=["telegram:*"],
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("debug", platform="telegram", context_length=1000)
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "anything"},
+        ])
+        assert engine._store.get_session_count("debug") == 0
+        assert engine._ignored_message_count == 0
+
+    def test_cursor_advances_when_filter_drops_entire_batch(self, tmp_path):
+        # When every message in a batch matches a filter pattern, _ingest_cursor
+        # must still advance to len(messages). Otherwise a second call with the
+        # same list would re-evaluate every message and double-increment the
+        # counter. Regression guard for the all-filtered early-return path.
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_cursor_all_filtered.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {"role": "user", "content": "Cronjob Response: alpha"},
+            {"role": "user", "content": "Cronjob Response: beta"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 2
+        assert engine._ingest_cursor == len(messages)
+
+        # Second call with the same list must not re-process the messages.
+        engine._ingest_messages(messages)
+        assert engine._ignored_message_count == 2
+        assert engine._ingest_cursor == len(messages)
+
+    def test_restart_reconciliation_skips_ignored_messages_when_matching_store_tail(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_restart_tail.db"
+        config = LCMConfig(
+            database_path=str(db_path),
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        active_context = [
+            {"role": "user", "content": "first real message"},
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "assistant", "content": "real answer"},
+        ]
+        before_restart._ingest_messages(active_context)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("user-123")
+        assert [row["content"] for row in rows] == ["first real message", "real answer"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_restart_reconciliation_skips_historical_ignored_rows_when_filter_enabled_later(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_restart_later_filter.db"
+        before_config = LCMConfig(database_path=str(db_path))
+
+        before_filter = LCMEngine(config=before_config)
+        before_filter.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        active_context = [
+            {"role": "user", "content": "first real message"},
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "assistant", "content": "real answer"},
+        ]
+        before_filter._ingest_messages(active_context)
+        before_filter._store.close()
+        before_filter._dag.close()
+        before_filter._lifecycle.close()
+
+        after_config = LCMConfig(
+            database_path=str(db_path),
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        after_filter_restart = LCMEngine(config=after_config)
+        after_filter_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        after_filter_restart._ingest_messages(active_context)
+
+        rows = after_filter_restart._store.get_session_messages("user-123")
+        assert [row["content"] for row in rows] == [
+            "first real message",
+            "Cronjob Response: heartbeat",
+            "real answer",
+        ]
+        assert after_filter_restart._ingest_cursor == len(active_context)
+
+    def test_restart_reconciliation_matches_legacy_stored_json_with_text_first_filter(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_legacy_multimodal_reconcile.db"
+        session_id = "legacy-structured-session"
+        active_context = [
+            {"role": "user", "content": "normal before ignored tail"},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Cronjob Response: heartbeat"}],
+            },
+        ]
+
+        before_restart = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        before_restart.on_session_start(
+            session_id,
+            platform="telegram",
+            conversation_id="legacy-structured-conversation",
+            context_length=1000,
+        )
+        before_restart._ingest_messages(active_context)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                ignore_message_patterns=["^Cronjob Response:"],
+            )
+        )
+        after_restart.on_session_start(
+            session_id,
+            platform="telegram",
+            conversation_id="legacy-structured-conversation",
+            context_length=1000,
+        )
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(session_id)
+        assert [row["content"] for row in rows] == [
+            "normal before ignored tail",
+            '[{"text": "Cronjob Response: heartbeat", "type": "text"}]',
+        ]
+        assert after_restart._ingest_cursor == len(active_context)
+
 
 class TestEngineIngest:
     def test_ingest_stores_messages(self, engine):
@@ -469,6 +2087,73 @@ class TestEngineCompress:
             messages.append({"role": "user", "content": f"Question {i}: " + "x" * 200})
             messages.append({"role": "assistant", "content": f"Answer {i}: " + "y" * 200})
         return messages
+
+    def test_compression_serialization_skips_empty_assistant_and_heartbeat_noise(self, engine):
+        messages = [
+            {"role": "assistant", "content": ""},
+            {"role": "assistant", "content": "ACK"},
+            {"role": "assistant", "content": "[heartbeat]"},
+            {"role": "user", "content": "keep this real user content"},
+            {"role": "assistant", "content": "keep this real assistant content"},
+        ]
+
+        serialized = engine._serialize_messages(messages)
+
+        assert "keep this real user content" in serialized
+        assert "[ASSISTANT]: keep this real assistant content" in serialized
+        assert serialized.count("[ASSISTANT]:") == 1
+        assert "[ASSISTANT]: ACK" not in serialized
+        assert "[ASSISTANT]: [heartbeat]" not in serialized
+
+    def test_compression_serialization_keeps_assistant_text_but_drops_orphaned_tool_calls(self, engine):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "I can still explain the plan without a completed tool call.",
+                "tool_calls": [
+                    {
+                        "id": "call_missing",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{\"command\": \"rm -rf noisy-orphan\"}"},
+                    }
+                ],
+            }
+        ]
+
+        serialized = engine._serialize_messages(messages)
+
+        assert "I can still explain the plan" in serialized
+        assert "terminal(" not in serialized
+        assert "noisy-orphan" not in serialized
+
+    def test_compression_serialization_keeps_matched_tool_pairs_and_drops_orphaned_results(self, engine):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "I will inspect the repo.",
+                "tool_calls": [
+                    {
+                        "id": "call_ok",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\": \"README.md\"}"},
+                    },
+                    {
+                        "id": "call_missing",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{\"command\": \"stale orphan args\"}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_ok", "content": "README says hello"},
+            {"role": "tool", "tool_call_id": "legacy_standalone", "content": "standalone legacy payload should remain canonical history"},
+        ]
+
+        serialized = engine._serialize_messages(messages)
+
+        assert "read_file(" in serialized
+        assert "README says hello" in serialized
+        assert "standalone legacy payload" in serialized
+        assert "stale orphan args" not in serialized
 
     def test_compress_short_conversation_noop(self, engine):
         """Short conversations should pass through unchanged."""
@@ -554,6 +2239,49 @@ class TestEngineCompress:
             assert node.latest_at == 1_700_000_000 + len(expected_store_ids) - 1
         finally:
             engine_module.summarize_with_escalation = original_fn
+
+    def test_compress_leaf_node_tracks_source_ids_for_content_part_messages(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "lcm_content_parts.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("content-parts-session", platform="cli", context_length=200000)
+
+        def mock_summary(**kwargs):
+            return "Content parts summary.\nExpand for details about: content parts", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        compacted_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "question text inside content parts"},
+                    {"type": "image_url", "image_url": {"url": "file:///tmp/example.png"}},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "answer text inside content parts"}],
+            },
+        ]
+        fresh_tail = [
+            {"role": "user", "content": "fresh user tail"},
+            {"role": "assistant", "content": "fresh assistant tail"},
+        ]
+        messages = [{"role": "system", "content": "sys"}] + compacted_messages + fresh_tail
+
+        result = instance.compress(messages)
+
+        nodes = instance._dag.get_session_nodes("content-parts-session")
+        stored_rows = instance._store.get_session_messages("content-parts-session")
+        expected_store_ids = [row["store_id"] for row in stored_rows[1:3]]
+        assert len(nodes) == 1
+        assert nodes[0].source_ids == expected_store_ids
+        assert instance._last_compacted_store_id == expected_store_ids[-1]
+        assert result[-2:] == fresh_tail
 
     def test_condensed_parent_node_tracks_child_source_window(self, engine, monkeypatch):
         child_windows = [
@@ -1235,6 +2963,120 @@ class TestSessionRetainDepth:
 
 
 class TestSessionRollover:
+    class HostAgentFrame:
+        def __init__(self, session_id: str, parent_session_id: str, hermes_home: Path):
+            self.session_id = session_id
+            self._parent_session_id = parent_session_id
+            self._hermes_home = hermes_home
+            self.enabled_toolsets = ["memory", "skills"]
+            self.log_prefix = "[subagent-test] "
+            self._subagent_id = session_id
+            self._delegate_depth = 1
+
+        def on_session_start(self, engine: LCMEngine, **kwargs) -> None:
+            engine.on_session_start(
+                self.session_id,
+                hermes_home=str(self._hermes_home),
+                platform=kwargs.pop("platform", "telegram"),
+                context_length=kwargs.pop("context_length", 200000),
+                **kwargs,
+            )
+
+        def update_model(self, engine: LCMEngine, context_length: int) -> None:
+            engine.update_model("child-model", context_length)
+
+        def should_compress_preflight(self, engine: LCMEngine, messages):
+            return engine.should_compress_preflight(messages)
+
+        def compress(self, engine: LCMEngine, messages):
+            return engine.compress(messages)
+
+        def update_from_response(self, engine: LCMEngine, usage: dict) -> None:
+            engine.update_from_response(usage)
+
+        def thread_context_session_id(self, engine: LCMEngine) -> str:
+            return engine._thread_context_session_id()
+
+        def thread_context_stateless(self, engine: LCMEngine) -> bool:
+            return engine._thread_context_stateless()
+
+        def on_session_end(self, engine: LCMEngine, messages) -> None:
+            engine.on_session_end(self.session_id, messages)
+
+    def _start_host_child(
+        self,
+        engine: LCMEngine,
+        hermes_home: Path,
+        session_id: str,
+        parent_session_id: str,
+        **kwargs,
+    ) -> HostAgentFrame:
+        frame = self.HostAgentFrame(session_id, parent_session_id, hermes_home)
+        frame.on_session_start(
+            engine,
+            **kwargs,
+        )
+        return frame
+
+    def test_on_session_end_fails_open_when_ingest_store_is_locked(self, engine, monkeypatch, caplog):
+        engine.on_session_start("test-session", platform="discord")
+
+        def locked_ingest(messages):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(engine, "_ingest_messages", locked_ingest)
+
+        with caplog.at_level(logging.WARNING):
+            engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+
+        assert "LCM session-end raw-message ingest skipped due to SQLite lock" in caplog.text
+
+    def test_on_session_end_fails_open_when_finalize_store_is_locked(self, engine, monkeypatch, caplog):
+        engine.on_session_start("test-session", platform="discord")
+
+        def locked_finalize(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(engine._lifecycle, "finalize_session", locked_finalize)
+
+        with caplog.at_level(logging.WARNING):
+            engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+
+        assert "LCM session-end lifecycle finalization skipped due to SQLite lock" in caplog.text
+
+    def test_on_session_end_returns_quickly_under_real_sqlite_writer_lock(self, engine, caplog):
+        engine.on_session_start("test-session", platform="discord")
+        engine._store._conn.execute("PRAGMA busy_timeout=750")
+        engine._lifecycle._conn.execute("PRAGMA busy_timeout=750")
+
+        locker = sqlite3.connect(str(engine._store.db_path), timeout=1.0, isolation_level=None)
+        locker.execute("PRAGMA journal_mode=WAL")
+        locker.execute("BEGIN IMMEDIATE")
+        try:
+            started = time.monotonic()
+            with caplog.at_level(logging.WARNING):
+                engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+            elapsed = time.monotonic() - started
+        finally:
+            locker.execute("ROLLBACK")
+            locker.close()
+
+        assert elapsed < 0.3
+        assert engine._store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
+        assert engine._lifecycle._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
+        assert "LCM session-end raw-message ingest skipped due to SQLite lock" in caplog.text
+
+    def test_on_session_end_reraises_non_lock_errors(self, engine, monkeypatch):
+        engine.on_session_start("test-session", platform="discord")
+
+        def broken_ingest(messages):
+            raise RuntimeError("not a lock")
+
+        monkeypatch.setattr(engine, "_ingest_messages", broken_ingest)
+
+        with pytest.raises(RuntimeError, match="not a lock"):
+            engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+
     def test_rollover_session_rebinds_engine_and_carries_retained_nodes(self, engine):
         engine._config.new_session_retain_depth = 2
         from hermes_lcm.dag import SummaryNode
@@ -1309,6 +3151,156 @@ class TestSessionRollover:
         assert engine._dag.get_session_nodes("s2") == []
         assert engine._session_id == "s3"
 
+    def test_rollover_session_current_session_retrieval_uses_new_session_after_carry_over(self, engine):
+        engine._config.new_session_retain_depth = 2
+        engine.on_session_start("old-retrieval", platform="cli", context_length=200000)
+        old_store_id = engine._store.append(
+            "old-retrieval",
+            {"role": "user", "content": "phoenix raw old-only context"},
+            token_estimate=9,
+            source="cli",
+        )
+        retained_node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-retrieval",
+            depth=2,
+            summary="phoenix retained rollover summary",
+            token_count=7,
+            source_token_count=9,
+            source_ids=[old_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        pruned_node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-retrieval",
+            depth=0,
+            summary="phoenix pruned rollover summary",
+            token_count=7,
+            source_token_count=9,
+            source_ids=[old_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+
+        moved = engine.rollover_session(
+            "old-retrieval",
+            "new-retrieval",
+            previous_messages=[],
+            platform="cli",
+            context_length=200000,
+        )
+
+        assert moved == 1
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "phoenix", "session_scope": "current", "sort": "relevance", "limit": 10},
+        ))
+        assert result["session_scope"] == "current"
+        assert result["total_results"] == 1
+        assert result["results"] == [
+            {
+                "type": "summary",
+                "depth": "d2",
+                "node_id": retained_node_id,
+                "session_id": "new-retrieval",
+                "snippet": "phoenix retained rollover summary",
+                "token_count": 7,
+                "expand_hint": "",
+                "earliest_at": None,
+                "latest_at": None,
+                "from_current_session": True,
+            }
+        ]
+        assert engine._dag.get_node(pruned_node_id) is None
+        assert engine._store.get_session_count("old-retrieval") == 1
+        assert engine._store.get_session_count("new-retrieval") == 0
+
+    def test_rollover_session_compression_boundary_keeps_depth_zero_nodes(self, engine):
+        engine._config.new_session_retain_depth = 2
+        engine.on_session_start("compress-rollover-old", platform="telegram", context_length=200000)
+        store_id = engine._store.append(
+            "compress-rollover-old",
+            {"role": "user", "content": "compression rollover keeps depth zero"},
+            token_estimate=13,
+            source="telegram",
+        )
+        node_id = engine._dag.add_node(SummaryNode(
+            session_id="compress-rollover-old",
+            depth=0,
+            summary="compression rollover depth zero summary",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = store_id
+        old_conversation_id = engine._conversation_id
+
+        moved = engine.rollover_session(
+            "compress-rollover-old",
+            "compress-rollover-new",
+            previous_messages=[],
+            boundary_reason="compression",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert moved == 1
+        assert engine._session_id == "compress-rollover-new"
+        assert engine._conversation_id == old_conversation_id
+        assert engine._store.get_session_count("compress-rollover-old") == 0
+        assert engine._store.get_session_count("compress-rollover-new") == 1
+        assert engine._dag.get_session_nodes("compress-rollover-old") == []
+        new_nodes = engine._dag.get_session_nodes("compress-rollover-new")
+        assert [node.node_id for node in new_nodes] == [node_id]
+        expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id}))
+        assert expanded["expanded"][0]["content"] == "compression rollover keeps depth zero"
+
+    def test_rollover_session_compression_boundary_respects_disabled_carry_over(self, engine):
+        engine._config.new_session_retain_depth = 2
+        engine.on_session_start("compress-no-carry-old", platform="telegram", context_length=200000)
+        store_id = engine._store.append(
+            "compress-no-carry-old",
+            {"role": "user", "content": "do not leak compression carry over"},
+            token_estimate=13,
+            source="telegram",
+        )
+        retained_node_id = engine._dag.add_node(SummaryNode(
+            session_id="compress-no-carry-old",
+            depth=2,
+            summary="do not leak retained summary",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = store_id
+        old_conversation_id = engine._conversation_id
+
+        moved = engine.rollover_session(
+            "compress-no-carry-old",
+            "compress-no-carry-new",
+            previous_messages=[],
+            carry_over_context=False,
+            boundary_reason="compression",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert moved == 0
+        assert engine._session_id == "compress-no-carry-new"
+        assert engine._conversation_id == old_conversation_id
+        assert engine._store.get_session_count("compress-no-carry-old") == 1
+        assert engine._store.get_session_count("compress-no-carry-new") == 0
+        assert [node.node_id for node in engine._dag.get_session_nodes("compress-no-carry-old")] == [retained_node_id]
+        assert engine._dag.get_session_nodes("compress-no-carry-new") == []
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "leak", "session_scope": "current", "sort": "relevance", "limit": 10},
+        ))
+        assert result["total_results"] == 0
+
     def test_rollover_session_skips_carry_over_when_old_session_is_not_bound(self, engine):
         engine._config.new_session_retain_depth = 2
 
@@ -1336,6 +3328,2052 @@ class TestSessionRollover:
         assert len(engine._dag.get_session_nodes("victim-session")) == 1
         assert engine._dag.get_session_nodes("attacker-new") == []
         assert engine._session_id == "attacker-new"
+
+    def test_live_auxiliary_child_session_does_not_rebind_shared_engine(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_auxiliary_child.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        foreground_store_id = engine._store.append(
+            "foreground-session",
+            {"role": "user", "content": "foreground context must stay bound"},
+            token_estimate=17,
+            source="telegram",
+        )
+        foreground_node_id = engine._dag.add_node(SummaryNode(
+            session_id="foreground-session",
+            depth=0,
+            summary="foreground summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[foreground_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = foreground_store_id
+        foreground_conversation_id = engine._conversation_id
+
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._conversation_id == foreground_conversation_id
+        assert engine._lifecycle.get_by_conversation(
+            foreground_conversation_id
+        ).current_session_id == "foreground-session"
+
+        background_messages = [
+            {"role": "user", "content": "background review must not enter LCM"},
+            {"role": "assistant", "content": "Nothing to save."},
+        ]
+        assert child.should_compress_preflight(engine, background_messages) is False
+        assert child.compress(engine, background_messages) == background_messages
+        child.on_session_end(engine, background_messages)
+
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert [
+            node.node_id for node in engine._dag.get_session_nodes("foreground-session")
+        ] == [foreground_node_id]
+
+        engine.on_session_start(
+            "foreground-continuation",
+            boundary_reason="compression",
+            old_session_id="foreground-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-continuation"
+        assert engine._conversation_id == foreground_conversation_id
+        assert engine._store.get_session_count("foreground-continuation") == 1
+        assert engine._dag.get_session_nodes("foreground-session") == []
+        assert [
+            node.node_id for node in engine._dag.get_session_nodes("foreground-continuation")
+        ] == [foreground_node_id]
+
+    def test_auxiliary_child_with_explicit_parent_id_and_aux_frame_does_not_need_state_db_row(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        class ExplicitParentAuxFrame:
+            def __init__(self, session_id: str, parent_session_id: str):
+                self.session_id = session_id
+                self._parent_session_id = parent_session_id
+                self.enabled_toolsets = ["memory", "skills"]
+                self.log_prefix = ""
+
+            def on_session_start(self, lcm_engine: LCMEngine) -> None:
+                lcm_engine.on_session_start(
+                    self.session_id,
+                    hermes_home=str(hermes_home),
+                    platform="telegram",
+                    context_length=200000,
+                    parent_session_id=self._parent_session_id,
+                )
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_explicit_parent.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        child = ExplicitParentAuxFrame("background-review-session", "foreground-session")
+        child.on_session_start(engine)
+
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        self.HostAgentFrame("background-review-session", "foreground-session", hermes_home).should_compress_preflight(engine, [
+            {"role": "user", "content": "explicit parent aux-frame child must stay stateless"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-session") == 0
+
+    def test_auxiliary_child_parent_id_can_be_inferred_from_host_agent_frame(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        class HostAgentFrame:
+            def __init__(self, session_id: str, parent_session_id: str):
+                self.session_id = session_id
+                self._parent_session_id = parent_session_id
+                self.enabled_toolsets = ["memory", "skills"]
+                self.log_prefix = ""
+
+            def notify_context_engine(self, lcm_engine: LCMEngine) -> None:
+                lcm_engine.on_session_start(
+                    self.session_id,
+                    hermes_home=str(hermes_home),
+                    platform="telegram",
+                    context_length=200000,
+                )
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_frame_parent.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        child = HostAgentFrame(
+            session_id="background-review-session",
+            parent_session_id="foreground-session",
+        )
+        child.notify_context_engine(engine)
+
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        self.HostAgentFrame(
+            "background-review-session",
+            "foreground-session",
+            hermes_home,
+        ).should_compress_preflight(engine, [
+            {"role": "user", "content": "frame parent child must stay stateless"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-session") == 0
+
+    def test_auxiliary_child_parent_frame_is_honored_even_on_fresh_engine(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_fresh_engine.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+
+        assert engine._session_id == ""
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        child.should_compress_preflight(engine, [
+            {"role": "user", "content": "fresh-engine child must stay stateless"},
+        ])
+        assert engine._store.get_session_count("background-review-session") == 0
+
+    def test_delegate_depth_only_parent_frame_is_auxiliary(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        class DelegateDepthOnlyFrame:
+            def __init__(self, session_id: str, parent_session_id: str):
+                self.session_id = session_id
+                self._parent_session_id = parent_session_id
+                self.enabled_toolsets = ["terminal", "file"]
+                self.log_prefix = ""
+                self._delegate_depth = 1
+
+            def on_session_start(self, lcm_engine: LCMEngine) -> None:
+                lcm_engine.on_session_start(
+                    self.session_id,
+                    hermes_home=str(hermes_home),
+                    platform="telegram",
+                    context_length=200000,
+                )
+
+            def should_compress_preflight(self, lcm_engine: LCMEngine, messages):
+                return lcm_engine.should_compress_preflight(messages)
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_delegate_depth_only.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        child = DelegateDepthOnlyFrame("delegate-child-session", "foreground-session")
+        child.on_session_start(engine)
+
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_has_auxiliary_session("delegate-child-session")
+        assert child.should_compress_preflight(engine, [
+            {"role": "user", "content": "delegate-depth child must stay stateless"},
+        ]) is False
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("delegate-child-session") == 0
+
+    def test_auxiliary_frame_detection_survives_wrapper_depth(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        class DeepWrappedChildFrame:
+            def __init__(self, session_id: str, parent_session_id: str):
+                self.session_id = session_id
+                self._parent_session_id = parent_session_id
+                self.enabled_toolsets = ["terminal", "file"]
+                self.log_prefix = "[subagent-deep] "
+                self._delegate_depth = 0
+
+            def on_session_start(self, lcm_engine: LCMEngine) -> None:
+                def wrapped(depth: int) -> None:
+                    if depth <= 0:
+                        lcm_engine.on_session_start(
+                            self.session_id,
+                            hermes_home=str(hermes_home),
+                            platform="telegram",
+                            context_length=200000,
+                        )
+                        return
+                    wrapped(depth - 1)
+
+                wrapped(20)
+
+            def should_compress_preflight(self, lcm_engine: LCMEngine, messages):
+                def wrapped(depth: int):
+                    if depth <= 0:
+                        return lcm_engine.should_compress_preflight(messages)
+                    return wrapped(depth - 1)
+
+                return wrapped(20)
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_deep_wrapper_aux.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        child = DeepWrappedChildFrame("deep-child-session", "foreground-session")
+        child.on_session_start(engine)
+
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_has_auxiliary_session("deep-child-session")
+        assert child.should_compress_preflight(engine, [
+            {"role": "user", "content": "deep wrapper child must stay stateless"},
+        ]) is False
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("deep-child-session") == 0
+
+    def test_unrelated_parent_frame_does_not_make_foreground_branch_auxiliary(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-branch-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        class UnrelatedFrame:
+            session_id = "some-other-session"
+            _parent_session_id = "foreground-session"
+
+            def notify_context_engine(self, lcm_engine: LCMEngine) -> None:
+                lcm_engine.on_session_start(
+                    "foreground-branch-session",
+                    hermes_home=str(hermes_home),
+                    platform="tui",
+                    context_length=200000,
+                )
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_unrelated_frame.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+        )
+        UnrelatedFrame().notify_context_engine(engine)
+
+        assert engine._session_id == "foreground-branch-session"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("foreground-branch-session")
+
+    def test_auxiliary_child_model_update_does_not_mutate_foreground_threshold(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        class HostAgentFrame:
+            def __init__(self, session_id: str, parent_session_id: str):
+                self.session_id = session_id
+                self._parent_session_id = parent_session_id
+                self.enabled_toolsets = ["memory", "skills"]
+                self.log_prefix = ""
+
+            def update_context_engine(self, lcm_engine: LCMEngine) -> None:
+                lcm_engine.update_model("tiny-child-model", 1000)
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_update_model.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.update_model("foreground-model", 200000)
+        assert engine.context_length == 200000
+        assert engine.threshold_tokens == int(200000 * config.context_threshold)
+
+        HostAgentFrame(
+            session_id="background-review-session",
+            parent_session_id="foreground-session",
+        ).update_context_engine(engine)
+
+        assert engine.context_length == 200000
+        assert engine.threshold_tokens == int(200000 * config.context_threshold)
+
+    def test_state_db_only_child_session_can_rebind_as_foreground_branch(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-branch-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_foreground_branch.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "foreground-branch-session",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-branch-session"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("foreground-branch-session")
+
+        engine.should_compress_preflight([
+            {"role": "user", "content": "foreground branch should persist normally"},
+        ])
+
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("foreground-branch-session") == 1
+
+    def test_explicit_parent_id_state_db_child_can_rebind_as_foreground_branch(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-branch-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_explicit_foreground_branch.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "foreground-branch-session",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+            parent_session_id="foreground-session",
+        )
+
+        assert engine._session_id == "foreground-branch-session"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("foreground-branch-session")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "explicit parent foreground branch should persist"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("foreground-branch-session") == 1
+
+    def test_explicit_parent_id_without_aux_frame_or_live_row_rebinds_foreground_branch(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_explicit_missing_row_branch.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "foreground-branch-session",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+            parent_session_id="foreground-session",
+        )
+
+        assert engine._session_id == "foreground-branch-session"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("foreground-branch-session")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "explicit parent missing row branch should persist"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("foreground-branch-session") == 1
+
+    def test_auxiliary_lineage_does_not_poison_reused_root_session_id(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_reused_aux_id.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-session",
+            "foreground-session",
+        )
+        engine.on_session_end("reused-session", [])
+        assert engine._has_auxiliary_lineage_session("reused-session")
+
+        engine.on_session_start(
+            "reused-session",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "reused-session"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("reused-session")
+        messages = [
+            {"role": "user", "content": "reused root session should persist normally"},
+        ]
+        engine.should_compress_preflight(messages)
+        assert engine._store.get_session_count("reused-session") == 1
+
+        messages.append({"role": "assistant", "content": "reused root session final message"})
+        engine.on_session_end(
+            "reused-session",
+            messages,
+        )
+        assert engine._store.get_session_count("reused-session") == 2
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert state.last_finalized_session_id == "reused-session"
+
+    def test_auxiliary_lineage_does_not_poison_reused_root_inside_non_aux_parent_frame(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_reused_aux_id_frame.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-session",
+            "foreground-session",
+        )
+        engine.on_session_end("reused-session", [])
+        assert engine._has_auxiliary_lineage_session("reused-session")
+
+        class ForegroundFrame:
+            def __init__(self):
+                self.session_id = "reused-session"
+                self._parent_session_id = "foreground-session"
+                self.enabled_toolsets = ["terminal", "file"]
+                self.log_prefix = ""
+                self._delegate_depth = 0
+
+            def should_compress_preflight(self, lcm_engine: LCMEngine, messages):
+                return lcm_engine.should_compress_preflight(messages)
+
+            def on_session_end(self, lcm_engine: LCMEngine, messages) -> None:
+                lcm_engine.on_session_end(self.session_id, messages)
+
+        engine.on_session_start(
+            "reused-session",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            context_length=200000,
+        )
+        frame = ForegroundFrame()
+        messages = [
+            {"role": "user", "content": "reused root frame should persist normally"},
+        ]
+        frame.should_compress_preflight(engine, messages)
+        assert engine._thread_context_session_id() == ""
+        assert engine._store.get_session_count("reused-session") == 1
+        messages.append({"role": "assistant", "content": "reused root frame final"})
+        frame.on_session_end(engine, messages)
+        assert engine._store.get_session_count("reused-session") == 2
+
+    def test_auxiliary_lineage_does_not_poison_reused_root_parent_branches(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('reused-parent', NULL, 10.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('reused-child-state', 'reused-parent', 11.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_reused_aux_parent_branch.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-parent",
+            "foreground-session",
+        )
+        assert engine._has_auxiliary_lineage_session("reused-parent")
+        assert engine._thread_context_has_auxiliary_session("reused-parent")
+
+        # If that id later becomes a real foreground/root session, the old
+        # auxiliary lineage must not poison real child branches under it.
+        engine.on_session_start(
+            "reused-parent",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            context_length=200000,
+        )
+        assert engine._session_id == "reused-parent"
+        assert not engine._thread_context_has_auxiliary_session("reused-parent")
+
+        engine.on_session_start(
+            "reused-child-state",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+        )
+        assert engine._session_id == "reused-child-state"
+        assert not engine._thread_context_has_auxiliary_session("reused-child-state")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "state-db child of reused parent persists"},
+        ])
+        assert engine._store.get_session_count("reused-child-state") == 1
+
+        engine.on_session_start(
+            "reused-parent",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "reused-child-explicit",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+            parent_session_id="reused-parent",
+        )
+        assert engine._session_id == "reused-child-explicit"
+        assert not engine._thread_context_has_auxiliary_session("reused-child-explicit")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "explicit child of reused parent persists"},
+        ])
+        assert engine._store.get_session_count("reused-child-explicit") == 1
+
+    def test_auxiliary_lineage_does_not_block_reused_root_compression_boundary(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_reused_aux_boundary.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-session",
+            "foreground-session",
+        )
+        engine.on_session_end("reused-session", [])
+        assert engine._has_auxiliary_lineage_session("reused-session")
+
+        engine.on_session_start(
+            "reused-session",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            context_length=200000,
+        )
+        store_id = engine._store.append(
+            "reused-session",
+            {"role": "user", "content": "reused root compression source"},
+            token_estimate=5,
+            source="cli",
+        )
+        node_id = engine._dag.add_node(SummaryNode(
+            session_id="reused-session",
+            depth=0,
+            summary="reused root node should move",
+            token_count=4,
+            source_token_count=5,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        conversation_id = engine._conversation_id
+        engine._last_compacted_store_id = store_id
+
+        engine.on_session_start(
+            "reused-continuation",
+            boundary_reason="compression",
+            old_session_id="reused-session",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "reused-continuation"
+        assert engine._conversation_id == conversation_id
+        assert engine._thread_context_session_id() == ""
+        assert engine._store.get_session_count("reused-continuation") == 1
+        assert engine._dag.get_session_nodes("reused-session") == []
+        assert [
+            node.node_id for node in engine._dag.get_session_nodes("reused-continuation")
+        ] == [node_id]
+
+    def test_auxiliary_child_worker_thread_stays_stateless_without_parent_thread_leak(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_worker_thread.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "delegate-child-session",
+            "foreground-session",
+        )
+
+        assert engine._thread_context_session_id() == ""
+        engine.should_compress_preflight([
+            {"role": "user", "content": "foreground parent thread must still persist"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("delegate-child-session") == 0
+
+        errors = []
+
+        def run_child_worker():
+            try:
+                assert child.should_compress_preflight(engine, [
+                    {"role": "user", "content": "delegate child worker must stay stateless"},
+                ]) is False
+                assert child.compress(engine, [
+                    {"role": "user", "content": "delegate child compression must bypass"},
+                ]) == [
+                    {"role": "user", "content": "delegate child compression must bypass"},
+                ]
+                child.update_from_response(engine, {
+                    "prompt_tokens": 999,
+                    "completion_tokens": 1,
+                    "total_tokens": 1000,
+                })
+                child.on_session_end(engine, [
+                    {"role": "assistant", "content": "delegate child end must not persist"},
+                ])
+            except Exception as exc:  # pragma: no cover - assertion helper
+                errors.append(exc)
+
+        worker = threading.Thread(target=run_child_worker)
+        worker.start()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert errors == []
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("delegate-child-session") == 0
+        assert engine.last_prompt_tokens == 0
+        assert not engine._thread_context_stateless()
+
+    def test_auxiliary_child_end_on_clean_parent_thread_does_not_poison_foreground(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_clean_parent_end.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+
+        engine.on_session_end(
+            "background-review-session",
+            [{"role": "assistant", "content": "background child end from parent thread"}],
+        )
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "foreground must persist after child end"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("background-review-session") == 0
+
+    def test_matching_parent_frame_foreground_branch_rebinds_normally(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-branch-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        class ForegroundBranchFrame:
+            def __init__(self):
+                self.session_id = "foreground-branch-session"
+                self._parent_session_id = "foreground-session"
+                self.enabled_toolsets = ["terminal", "file"]
+                self.log_prefix = ""
+                self._delegate_depth = 0
+
+            def on_session_start(self, lcm_engine: LCMEngine) -> None:
+                lcm_engine.on_session_start(
+                    self.session_id,
+                    hermes_home=str(hermes_home),
+                    platform="tui",
+                    context_length=200000,
+                )
+
+            def should_compress_preflight(self, lcm_engine: LCMEngine, messages):
+                return lcm_engine.should_compress_preflight(messages)
+
+            def update_model(self, lcm_engine: LCMEngine, context_length: int) -> None:
+                lcm_engine.update_model("foreground-branch-model", context_length)
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_matching_foreground_branch.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        branch = ForegroundBranchFrame()
+        branch.on_session_start(engine)
+
+        assert engine._session_id == "foreground-branch-session"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("foreground-branch-session")
+        branch.update_model(engine, 300000)
+        assert engine.context_length == 300000
+        assert engine.threshold_tokens == int(300000 * config.context_threshold)
+        branch.should_compress_preflight(engine, [
+            {"role": "user", "content": "foreground branch must persist"},
+        ])
+        assert engine._store.get_session_count("foreground-branch-session") == 1
+        assert engine._store.get_session_count("foreground-session") == 0
+
+    def test_auxiliary_child_update_from_response_does_not_mutate_foreground_metrics(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_usage.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        foreground_usage = {
+            "prompt_tokens": 12345,
+            "completion_tokens": 10,
+            "total_tokens": 12355,
+            "input_tokens": 12000,
+            "output_tokens": 355,
+            "cache_read_tokens": 6000,
+            "cache_write_tokens": 500,
+            "reasoning_tokens": 42,
+        }
+        engine.update_from_response(foreground_usage)
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        child.update_from_response(engine, {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2,
+            "input_tokens": 3,
+            "output_tokens": 4,
+            "cache_read_tokens": 5,
+            "cache_write_tokens": 6,
+            "reasoning_tokens": 7,
+        })
+
+        assert engine.last_prompt_tokens == 12345
+        assert engine.last_completion_tokens == 10
+        assert engine.last_total_tokens == 12355
+        assert engine.last_input_tokens == 12000
+        assert engine.last_output_tokens == 355
+        assert engine.last_cache_read_tokens == 6000
+        assert engine.last_cache_write_tokens == 500
+        assert engine.last_reasoning_tokens == 42
+        assert engine.cache_metrics_available is True
+
+        engine.update_from_response({
+            "prompt_tokens": 222,
+            "completion_tokens": 3,
+            "total_tokens": 225,
+            "cache_read_tokens": 11,
+            "cache_write_tokens": 12,
+        })
+        assert engine.last_prompt_tokens == 222
+        assert engine.last_total_tokens == 225
+        assert engine.last_cache_read_tokens == 11
+        assert engine.last_cache_write_tokens == 12
+
+    def test_stale_auxiliary_thread_marker_clears_on_next_normal_session_start(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('next-normal-session', NULL, 3.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_stale_aux_marker.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._session_id == "foreground-session"
+
+        engine.on_session_start(
+            "next-normal-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._thread_context_session_id() == ""
+        assert engine._session_id == "next-normal-session"
+        messages = [
+            {"role": "user", "content": "normal foreground ingestion returns"},
+        ]
+        engine.should_compress_preflight(messages)
+
+        assert engine._store.get_session_count("next-normal-session") == 1
+        assert engine._store.get_session_count("background-review-session") == 0
+
+    def test_stale_auxiliary_thread_marker_clears_before_compression_boundary(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_stale_aux_boundary.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        foreground_store_id = engine._store.append(
+            "foreground-session",
+            {"role": "user", "content": "foreground context crosses boundary"},
+            token_estimate=17,
+            source="telegram",
+        )
+        foreground_node_id = engine._dag.add_node(SummaryNode(
+            session_id="foreground-session",
+            depth=0,
+            summary="foreground boundary summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[foreground_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = foreground_store_id
+        foreground_conversation_id = engine._conversation_id
+
+        self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._session_id == "foreground-session"
+
+        engine.on_session_start(
+            "foreground-continuation",
+            boundary_reason="compression",
+            old_session_id="foreground-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._session_id == "foreground-continuation"
+        assert engine._conversation_id == foreground_conversation_id
+        assert [
+            node.node_id for node in engine._dag.get_session_nodes("foreground-continuation")
+        ] == [foreground_node_id]
+
+        messages = [
+            {"role": "user", "content": "post-boundary foreground ingestion returns"},
+        ]
+        engine.should_compress_preflight(messages)
+
+        background_messages = [
+            {"role": "user", "content": "late background review must still not persist"},
+        ]
+        engine.on_session_end("background-review-session", background_messages)
+
+        assert engine._store.get_session_count("foreground-continuation") == 2
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+
+    def test_auxiliary_compression_boundary_does_not_reassign_foreground_state(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-continuation', 'background-review-session', 3.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_boundary.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        foreground_store_id = engine._store.append(
+            "foreground-session",
+            {"role": "user", "content": "foreground must not move into child continuation"},
+            token_estimate=13,
+            source="telegram",
+        )
+        foreground_node_id = engine._dag.add_node(SummaryNode(
+            session_id="foreground-session",
+            depth=0,
+            summary="foreground must stay foreground",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[foreground_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = foreground_store_id
+        foreground_conversation_id = engine._conversation_id
+
+        self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+
+        engine.on_session_start(
+            "background-review-continuation",
+            boundary_reason="compression",
+            old_session_id="background-review-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-session"
+        assert engine._conversation_id == foreground_conversation_id
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._thread_context_has_auxiliary_session("background-review-continuation")
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("background-review-continuation") == 0
+        assert [
+            node.node_id for node in engine._dag.get_session_nodes("foreground-session")
+        ] == [foreground_node_id]
+        assert engine._dag.get_session_nodes("background-review-continuation") == []
+
+        engine.on_session_end(
+            "background-review-session",
+            [{"role": "user", "content": "old child end must not persist"}],
+        )
+        engine.on_session_end(
+            "background-review-continuation",
+            [{"role": "user", "content": "new child end must not persist"}],
+        )
+
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._store.get_session_count("background-review-continuation") == 0
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert not engine._thread_context_has_auxiliary_session("background-review-continuation")
+
+    def test_auxiliary_compression_boundary_retires_old_child_if_old_end_is_missing(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-continuation', 'background-review-session', 3.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_handoff_missing_old_end.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        child.should_compress_preflight(engine, [
+            {"role": "user", "content": "old child work must stay stateless"},
+        ])
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+
+        engine.on_session_start(
+            "background-review-continuation",
+            boundary_reason="compression",
+            old_session_id="background-review-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._thread_context_has_auxiliary_session("background-review-continuation")
+        continuation = self.HostAgentFrame(
+            "background-review-continuation",
+            "background-review-session",
+            hermes_home,
+        )
+        continuation.should_compress_preflight(engine, [
+            {"role": "user", "content": "new child work must stay stateless"},
+        ])
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._store.get_session_count("background-review-continuation") == 0
+
+        continuation.on_session_end(engine, [
+            {"role": "user", "content": "new child end must not persist"},
+        ])
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert not engine._thread_context_has_auxiliary_session("background-review-continuation")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "foreground persists after child compression handoff"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._store.get_session_count("background-review-continuation") == 0
+
+    def test_auxiliary_compression_boundary_after_child_end_stays_auxiliary(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, 3.0);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-continuation', 'background-review-session', 4.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_late_boundary.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        foreground_store_id = engine._store.append(
+            "foreground-session",
+            {"role": "user", "content": "foreground must survive late auxiliary boundary"},
+            token_estimate=13,
+            source="telegram",
+        )
+        foreground_node_id = engine._dag.add_node(SummaryNode(
+            session_id="foreground-session",
+            depth=0,
+            summary="foreground must not move after child end",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[foreground_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = foreground_store_id
+        foreground_conversation_id = engine._conversation_id
+
+        # The child was seen as auxiliary while live, then ended before its
+        # compression continuation starts. A clean foreground thread must stay
+        # clean; the continuation is stateless only when executed through the
+        # auxiliary child frame/lineage.
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        child.on_session_end(engine, [
+            {"role": "user", "content": "ended child must not persist"},
+        ])
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+
+        engine.on_session_start(
+            "background-review-continuation",
+            boundary_reason="compression",
+            old_session_id="background-review-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-session"
+        assert engine._conversation_id == foreground_conversation_id
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-continuation")
+        continuation = self.HostAgentFrame(
+            "background-review-continuation",
+            "background-review-session",
+            hermes_home,
+        )
+        continuation.should_compress_preflight(engine, [
+            {"role": "user", "content": "continuation child must not persist"},
+        ])
+        assert engine._thread_context_session_id() == ""
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._store.get_session_count("background-review-continuation") == 0
+        assert [
+            node.node_id for node in engine._dag.get_session_nodes("foreground-session")
+        ] == [foreground_node_id]
+        assert engine._dag.get_session_nodes("background-review-continuation") == []
+
+    def test_multiple_auxiliary_child_sessions_are_tracked_independently(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-a', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-b', 'foreground-session', 3.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_multiple_aux.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        a = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-a",
+            "foreground-session",
+        )
+        b = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-b",
+            "foreground-session",
+        )
+
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-a")
+        assert engine._thread_context_has_auxiliary_session("background-review-b")
+        assert b.thread_context_session_id(engine) == "background-review-b"
+        b.should_compress_preflight(engine, [
+            {"role": "user", "content": "child b worker must be stateless"},
+        ])
+        assert engine._thread_context_session_id() == ""
+
+        engine.on_session_end(
+            "background-review-a",
+            [{"role": "user", "content": "first background review must not persist"}],
+        )
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("background-review-a")
+        assert engine._thread_context_has_auxiliary_session("background-review-b")
+        assert engine._store.get_session_count("background-review-a") == 0
+
+        b.on_session_end(engine, [
+            {"role": "user", "content": "second background review must not persist"},
+        ])
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+        assert not engine._thread_context_has_auxiliary_session("background-review-b")
+        assert engine._store.get_session_count("background-review-a") == 0
+        assert engine._store.get_session_count("background-review-b") == 0
+        engine.should_compress_preflight([
+            {"role": "user", "content": "foreground persists after auxiliary children end"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 1
+
+    def test_nested_auxiliary_child_end_restores_previous_thread_marker(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-a', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-b', 'foreground-session', 3.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_nested_aux.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        a = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-a",
+            "foreground-session",
+        )
+        b = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-b",
+            "foreground-session",
+        )
+        assert a.thread_context_session_id(engine) == "background-review-a"
+        a.should_compress_preflight(engine, [
+            {"role": "user", "content": "child a worker must be stateless"},
+        ])
+        assert b.thread_context_session_id(engine) == "background-review-b"
+        b.should_compress_preflight(engine, [
+            {"role": "user", "content": "child b worker must be stateless"},
+        ])
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+
+        b.on_session_end(engine, [
+            {"role": "user", "content": "nested child b must not persist"},
+        ])
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+        assert engine._thread_context_has_auxiliary_session("background-review-a")
+        assert not engine._thread_context_has_auxiliary_session("background-review-b")
+
+        a.should_compress_preflight(engine, [
+            {"role": "user", "content": "continuing child a must still be stateless"},
+        ])
+
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-a") == 0
+        assert engine._store.get_session_count("background-review-b") == 0
+
+        a.on_session_end(engine, [
+            {"role": "user", "content": "nested child a must not persist"},
+        ])
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+        assert not engine._thread_context_has_auxiliary_session("background-review-a")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "foreground persists after nested children end"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("background-review-a") == 0
+        assert engine._store.get_session_count("background-review-b") == 0
+
+    def test_auxiliary_descendant_session_does_not_rebind_shared_engine(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-a', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-followup', 'background-review-a', 3.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_descendant.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        parent = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-a",
+            "foreground-session",
+        )
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-a")
+        assert parent.thread_context_session_id(engine) == "background-review-a"
+        parent.should_compress_preflight(engine, [
+            {"role": "user", "content": "parent auxiliary must be stateless"},
+        ])
+        assert engine._thread_context_session_id() == ""
+
+        engine.on_session_start(
+            "background-review-followup",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-a")
+        assert engine._thread_context_has_auxiliary_session("background-review-followup")
+        followup = self.HostAgentFrame(
+            "background-review-followup",
+            "background-review-a",
+            hermes_home,
+        )
+        followup.should_compress_preflight(engine, [
+            {"role": "user", "content": "descendant auxiliary must stay stateless"},
+        ])
+        assert followup.thread_context_session_id(engine) == "background-review-followup"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-a") == 0
+        assert engine._store.get_session_count("background-review-followup") == 0
+
+        followup.on_session_end(engine, [
+            {"role": "user", "content": "followup end must not persist"},
+        ])
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+        assert engine._thread_context_has_auxiliary_session("background-review-a")
+        assert not engine._thread_context_has_auxiliary_session("background-review-followup")
+
+        parent.on_session_end(engine, [
+            {"role": "user", "content": "parent auxiliary end must not persist"},
+        ])
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+        assert not engine._thread_context_has_auxiliary_session("background-review-a")
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-a") == 0
+        assert engine._store.get_session_count("background-review-followup") == 0
+
+    def test_auxiliary_descendant_after_parent_end_stays_auxiliary(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-a', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-followup', 'background-review-a', 4.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_descendant_late.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-a",
+            "foreground-session",
+        )
+        engine.on_session_end(
+            "background-review-a",
+            [{"role": "user", "content": "parent auxiliary ended first"}],
+        )
+        conn = sqlite3.connect(state_db)
+        conn.execute(
+            "UPDATE sessions SET ended_at = 3.0 WHERE id = 'background-review-a'"
+        )
+        conn.commit()
+        conn.close()
+
+        assert not engine._thread_context_has_auxiliary_session("background-review-a")
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+
+        engine.on_session_start(
+            "background-review-followup",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == ""
+        assert engine._thread_context_has_auxiliary_session("background-review-followup")
+        followup = self.HostAgentFrame(
+            "background-review-followup",
+            "background-review-a",
+            hermes_home,
+        )
+        followup.should_compress_preflight(engine, [
+            {"role": "user", "content": "late descendant auxiliary must stay stateless"},
+        ])
+        assert followup.thread_context_session_id(engine) == "background-review-followup"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-a") == 0
+        assert engine._store.get_session_count("background-review-followup") == 0
+
+    def test_auxiliary_child_end_is_ignored_across_threads(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_cross_thread_aux.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        child.should_compress_preflight(engine, [
+            {"role": "user", "content": "child worker must be stateless before cross-thread end"},
+        ])
+
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+
+        errors = []
+
+        def end_auxiliary_child():
+            try:
+                engine.on_session_end(
+                    "background-review-session",
+                    [{"role": "user", "content": "cross-thread child end must not persist"}],
+                )
+            except Exception as exc:  # pragma: no cover - assertion helper
+                errors.append(exc)
+
+        thread = threading.Thread(target=end_auxiliary_child)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert errors == []
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._session_id == "foreground-session"
+        engine.should_compress_preflight([
+            {"role": "user", "content": "foreground persists after cross-thread auxiliary end"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 1
+
+    def test_same_thread_late_auxiliary_callback_after_end_stays_stateless(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_same_thread_late_aux.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        child.should_compress_preflight(engine, [
+            {"role": "user", "content": "child worker must become stateless"},
+        ])
+        assert child.thread_context_session_id(engine) == "background-review-session"
+        assert child.thread_context_stateless(engine)
+        assert engine._thread_context_session_id() == ""
+
+        child.on_session_end(engine, [])
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+
+        child.should_compress_preflight(engine, [
+            {"role": "user", "content": "same-thread late child callback must not persist"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-session") == 0
+
+        engine.should_compress_preflight([
+            {"role": "user", "content": "bare foreground callback persists after child end"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 1
+
+        engine.on_session_start(
+            "foreground-followup-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        assert engine._thread_context_session_id() == ""
+        engine.should_compress_preflight([
+            {"role": "user", "content": "foreground followup persists after marker clear"},
+        ])
+        assert engine._store.get_session_count("foreground-followup-session") == 1
+
+    def test_ended_auxiliary_marker_stays_stateless_until_next_normal_session_start(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_stale_inactive_marker.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        child.should_compress_preflight(engine, [
+            {"role": "user", "content": "child worker must become stateless"},
+        ])
+        assert child.thread_context_session_id(engine) == "background-review-session"
+        assert child.thread_context_stateless(engine)
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+
+        errors = []
+
+        def end_auxiliary_child():
+            try:
+                engine.on_session_end("background-review-session", [])
+            except Exception as exc:  # pragma: no cover - assertion helper
+                errors.append(exc)
+
+        thread = threading.Thread(target=end_auxiliary_child)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert errors == []
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+
+        late_child_messages = [
+            {"role": "user", "content": "late child callback must stay stateless after cross-thread end"},
+        ]
+        child.should_compress_preflight(engine, late_child_messages)
+
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-session") == 0
+
+        engine.should_compress_preflight([
+            {"role": "user", "content": "bare foreground callback persists after cross-thread child end"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 1
+
+        engine.on_session_start(
+            "foreground-followup-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+
+        messages = [{"role": "user", "content": "foreground must persist after normal start"}]
+        engine.should_compress_preflight(messages)
+
+        assert engine._store.get_session_count("foreground-followup-session") == 1
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("background-review-session") == 0
+
+    def test_historical_child_session_is_not_treated_as_live_auxiliary(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, 10.0);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('historical-child-session', 'foreground-session', 2.0, 3.0);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_historical_child.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "historical-child-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("historical-child-session")
+        assert engine._session_id == "historical-child-session"
+        messages = [
+            {"role": "user", "content": "historical child resume should persist normally"},
+        ]
+        engine.should_compress_preflight(messages)
+
+        assert engine._store.get_session_count("historical-child-session") == 1
 
     def test_compression_boundary_continues_logical_session_without_resetting_state(self, engine):
         engine.on_session_start("old-session", platform="telegram", context_length=200000)
@@ -1396,6 +5434,251 @@ class TestSessionRollover:
         assert status["lifecycle"]["last_finalized_frontier_store_id"] == store_id
         assert status["lifecycle"]["last_rollover_at"] is not None
         assert status["lifecycle"]["last_reset_at"] is None
+
+    def test_compression_boundary_uses_bound_lcm_source_when_host_old_session_differs(self, engine):
+        engine.on_session_start("lcm-source", platform="telegram", context_length=200000)
+        source_store_id = engine._store.append(
+            "lcm-source",
+            {"role": "user", "content": "important LCM-bound context"},
+            token_estimate=17,
+            source="telegram",
+        )
+        stale_host_store_id = engine._store.append(
+            "old-hermes-session",
+            {"role": "user", "content": "unrelated stale host context"},
+            token_estimate=11,
+            source="telegram",
+        )
+        source_node_id = engine._dag.add_node(SummaryNode(
+            session_id="lcm-source",
+            depth=0,
+            summary="LCM-bound summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[source_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        stale_host_node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-hermes-session",
+            depth=0,
+            summary="stale host summary should not move",
+            token_count=5,
+            source_token_count=11,
+            source_ids=[stale_host_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine.compression_count = 2
+        engine.last_prompt_tokens = 1000
+        engine.last_completion_tokens = 50
+        engine.last_total_tokens = 1050
+        engine._last_compacted_store_id = source_store_id
+        engine._ingest_cursor = 2
+        old_conversation_id = engine._conversation_id
+
+        engine.on_session_start(
+            "new-hermes-session",
+            boundary_reason="compression",
+            old_session_id="old-hermes-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "new-hermes-session"
+        assert engine._conversation_id == old_conversation_id
+        assert engine.compression_count == 2
+        assert engine.last_prompt_tokens == 1000
+        assert engine.last_completion_tokens == 50
+        assert engine.last_total_tokens == 1050
+        assert engine._last_compacted_store_id == source_store_id
+        assert engine._ingest_cursor == 2
+        assert engine._store.get_session_count("lcm-source") == 0
+        assert engine._store.get_session_count("new-hermes-session") == 1
+        assert engine._store.get_session_count("old-hermes-session") == 1
+        assert engine._dag.get_session_nodes("lcm-source") == []
+        new_nodes = engine._dag.get_session_nodes("new-hermes-session")
+        assert len(new_nodes) == 1
+        assert new_nodes[0].node_id == source_node_id
+        assert new_nodes[0].summary == "LCM-bound summary"
+        stale_host_node = engine._dag.get_node(stale_host_node_id)
+        assert stale_host_node is not None
+        assert stale_host_node.session_id == "old-hermes-session"
+
+        status = engine.get_status()
+        assert status["store_messages"] == 1
+        assert status["dag_nodes"] == 1
+        assert status["compression_count"] == 2
+        expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": source_node_id}))
+        assert expanded["expanded"][0]["content"] == "important LCM-bound context"
+
+    def test_compression_boundary_uses_finalized_bound_lcm_source_when_host_old_session_differs(self, engine):
+        engine.on_session_start("lcm-source", platform="telegram", context_length=200000)
+        source_store_id = engine._store.append(
+            "lcm-source",
+            {"role": "user", "content": "finalized LCM-bound context"},
+            token_estimate=17,
+            source="telegram",
+        )
+        stale_host_store_id = engine._store.append(
+            "old-hermes-session",
+            {"role": "user", "content": "unrelated stale host context"},
+            token_estimate=11,
+            source="telegram",
+        )
+        source_node_id = engine._dag.add_node(SummaryNode(
+            session_id="lcm-source",
+            depth=0,
+            summary="finalized LCM-bound summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[source_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        stale_host_node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-hermes-session",
+            depth=0,
+            summary="stale host summary should not move",
+            token_count=5,
+            source_token_count=11,
+            source_ids=[stale_host_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine.compression_count = 2
+        engine.last_prompt_tokens = 1000
+        engine.last_completion_tokens = 50
+        engine.last_total_tokens = 1050
+        engine._last_compacted_store_id = source_store_id
+        engine._ingest_cursor = 2
+        old_conversation_id = engine._conversation_id
+        engine._lifecycle.finalize_session(
+            old_conversation_id,
+            "lcm-source",
+            frontier_store_id=source_store_id,
+        )
+        finalized = engine._lifecycle.get_by_conversation(old_conversation_id)
+        assert finalized is not None
+        assert finalized.current_session_id is None
+        assert finalized.last_finalized_session_id == "lcm-source"
+        # Prove the rollover restores the finalized lifecycle frontier, not only
+        # the engine's in-memory compacted marker.
+        engine._last_compacted_store_id = 0
+
+        engine.on_session_start(
+            "new-hermes-session",
+            boundary_reason="compression",
+            old_session_id="old-hermes-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "new-hermes-session"
+        assert engine._conversation_id == old_conversation_id
+        assert engine.compression_count == 2
+        assert engine.last_prompt_tokens == 1000
+        assert engine.last_completion_tokens == 50
+        assert engine.last_total_tokens == 1050
+        assert engine._last_compacted_store_id == source_store_id
+        assert engine._ingest_cursor == 2
+        assert engine._store.get_session_count("lcm-source") == 0
+        assert engine._store.get_session_count("new-hermes-session") == 1
+        assert engine._store.get_session_count("old-hermes-session") == 1
+        assert engine._dag.get_session_nodes("lcm-source") == []
+        new_nodes = engine._dag.get_session_nodes("new-hermes-session")
+        assert len(new_nodes) == 1
+        assert new_nodes[0].node_id == source_node_id
+        stale_host_node = engine._dag.get_node(stale_host_node_id)
+        assert stale_host_node is not None
+        assert stale_host_node.session_id == "old-hermes-session"
+        lifecycle = engine._lifecycle.get_by_conversation(old_conversation_id)
+        assert lifecycle is not None
+        assert lifecycle.current_session_id == "new-hermes-session"
+        assert lifecycle.last_finalized_session_id == "lcm-source"
+        assert lifecycle.current_frontier_store_id == source_store_id
+        assert lifecycle.last_finalized_frontier_store_id == source_store_id
+        expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": source_node_id}))
+        assert expanded["expanded"][0]["content"] == "finalized LCM-bound context"
+
+    def test_compression_boundary_rejects_bound_source_for_explicit_conversation_mismatch(self, engine):
+        engine.on_session_start(
+            "lcm-source",
+            platform="telegram",
+            context_length=200000,
+            conversation_id="conversation-a",
+        )
+        source_store_id = engine._store.append(
+            "lcm-source",
+            {"role": "user", "content": "conversation A context"},
+            token_estimate=17,
+            source="telegram",
+        )
+        stale_host_store_id = engine._store.append(
+            "old-hermes-session",
+            {"role": "user", "content": "unrelated stale host context"},
+            token_estimate=11,
+            source="telegram",
+        )
+        source_node_id = engine._dag.add_node(SummaryNode(
+            session_id="lcm-source",
+            depth=0,
+            summary="conversation A summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[source_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        stale_host_node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-hermes-session",
+            depth=0,
+            summary="stale host summary should not move",
+            token_count=5,
+            source_token_count=11,
+            source_ids=[stale_host_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine.compression_count = 2
+        engine._last_compacted_store_id = source_store_id
+        engine._ingest_cursor = 2
+        engine._lifecycle.finalize_session(
+            "conversation-a",
+            "lcm-source",
+            frontier_store_id=source_store_id,
+        )
+
+        engine.on_session_start(
+            "new-hermes-session",
+            boundary_reason="compression",
+            old_session_id="old-hermes-session",
+            conversation_id="conversation-b",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "new-hermes-session"
+        assert engine._conversation_id == "conversation-b"
+        assert engine.compression_count == 0
+        assert engine._last_compacted_store_id == 0
+        assert engine._ingest_cursor == 0
+        assert engine._store.get_session_count("lcm-source") == 1
+        assert engine._store.get_session_count("new-hermes-session") == 0
+        assert engine._store.get_session_count("old-hermes-session") == 1
+        source_node = engine._dag.get_node(source_node_id)
+        assert source_node is not None
+        assert source_node.session_id == "lcm-source"
+        stale_host_node = engine._dag.get_node(stale_host_node_id)
+        assert stale_host_node is not None
+        assert stale_host_node.session_id == "old-hermes-session"
+        conversation_a = engine._lifecycle.get_by_conversation("conversation-a")
+        assert conversation_a is not None
+        assert conversation_a.current_session_id is None
+        assert conversation_a.last_finalized_session_id == "lcm-source"
+        conversation_b = engine._lifecycle.get_by_conversation("conversation-b")
+        assert conversation_b is not None
+        assert conversation_b.current_session_id == "new-hermes-session"
 
     def test_compression_boundary_mismatch_resets_session_scoped_state(self, engine):
         engine.on_session_start("bound-session", platform="telegram", context_length=200000)
@@ -1503,6 +5786,174 @@ class TestSessionRollover:
         assert state_repeat.current_session_id == "s2"
         assert state_repeat.last_finalized_session_id == "s1"
         assert engine._lifecycle.row_count() == 1
+
+    def test_legacy_reset_then_start_finalizes_old_lifecycle_before_new_bind(self, engine):
+        engine.on_session_start("legacy-old", platform="cli", context_length=200000)
+        store_id = engine._store.append(
+            "legacy-old",
+            {"role": "user", "content": "legacy host context before /new"},
+            token_estimate=17,
+            source="cli",
+        )
+        engine._last_compacted_store_id = store_id
+        old_conversation_id = engine._conversation_id
+
+        # Older Hermes hosts may not call rollover_session(...) yet. They can
+        # still call the older lifecycle pair: reset current state, then bind a
+        # fresh session. LCM must not leave the old conversation marked current.
+        engine.on_session_reset()
+        engine.on_session_start("legacy-new", platform="cli", context_length=200000)
+
+        old_state = engine._lifecycle.get_by_conversation(old_conversation_id)
+        assert old_state is not None
+        assert old_state.current_session_id is None
+        assert old_state.last_finalized_session_id == "legacy-old"
+        assert old_state.last_finalized_frontier_store_id == store_id
+        assert old_state.last_reset_at is not None
+
+        new_state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert new_state is not None
+        assert new_state.conversation_id == "legacy-new"
+        assert new_state.current_session_id == "legacy-new"
+        assert new_state.last_finalized_session_id is None
+        assert engine._lifecycle.row_count() == 2
+
+    def test_same_session_reset_keeps_lifecycle_current_and_allows_future_frontier_updates(self, engine):
+        engine.on_session_start("same-session", platform="cli", context_length=200000)
+        first_store_id = engine._store.append(
+            "same-session",
+            {"role": "user", "content": "before reset"},
+            token_estimate=7,
+            source="cli",
+        )
+        engine._last_compacted_store_id = first_store_id
+
+        engine.on_session_reset()
+        after_reset = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert after_reset is not None
+        assert after_reset.current_session_id == "same-session"
+        assert after_reset.last_finalized_session_id is None
+        assert after_reset.last_reset_at is not None
+
+        second_store_id = engine._store.append(
+            "same-session",
+            {"role": "assistant", "content": "after reset"},
+            token_estimate=9,
+            source="cli",
+        )
+        engine._last_compacted_store_id = second_store_id
+        engine._persist_frontier_marker()
+
+        after_frontier = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert after_frontier is not None
+        assert after_frontier.current_session_id == "same-session"
+        assert after_frontier.current_frontier_store_id == second_store_id
+
+    def test_same_session_reset_then_later_new_session_preserves_latest_frontier(self, engine):
+        engine.on_session_start("same-then-new", platform="cli", context_length=200000)
+        first_store_id = engine._store.append(
+            "same-then-new",
+            {"role": "user", "content": "before reset"},
+            token_estimate=7,
+            source="cli",
+        )
+        engine._last_compacted_store_id = first_store_id
+        old_conversation_id = engine._conversation_id
+
+        engine.on_session_reset()
+        second_store_id = engine._store.append(
+            "same-then-new",
+            {"role": "assistant", "content": "same session continued after reset"},
+            token_estimate=11,
+            source="cli",
+        )
+        engine._last_compacted_store_id = second_store_id
+        engine._persist_frontier_marker()
+
+        engine.on_session_start("eventual-new", platform="cli", context_length=200000)
+
+        old_state = engine._lifecycle.get_by_conversation(old_conversation_id)
+        assert old_state is not None
+        assert old_state.current_session_id is None
+        assert old_state.last_finalized_session_id == "same-then-new"
+        assert old_state.last_finalized_frontier_store_id == second_store_id
+        assert engine._pending_reset_session_id == ""
+
+    def test_reset_before_compression_boundary_does_not_leave_stale_pending_reset(self, engine):
+        engine.on_session_start("compress-old", platform="telegram", context_length=200000)
+        store_id = engine._store.append(
+            "compress-old",
+            {"role": "user", "content": "compression boundary after reset"},
+            token_estimate=13,
+            source="telegram",
+        )
+        engine._dag.add_node(SummaryNode(
+            session_id="compress-old",
+            depth=0,
+            summary="compression summary",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = store_id
+
+        engine.on_session_reset()
+        assert engine._pending_reset_session_id == "compress-old"
+
+        engine.on_session_start(
+            "compress-new",
+            boundary_reason="compression",
+            old_session_id="compress-old",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._pending_reset_session_id == ""
+        status = engine.get_status()
+        assert status["lifecycle"]["current_session_id"] == "compress-new"
+        assert status["lifecycle"]["last_finalized_session_id"] == "compress-old"
+        assert status["lifecycle"]["last_finalized_frontier_store_id"] == store_id
+
+    def test_reset_before_compression_boundary_mismatch_finalizes_pending_old_session(self, engine):
+        engine.on_session_start("bound-after-reset", platform="telegram", context_length=200000)
+        store_id = engine._store.append(
+            "bound-after-reset",
+            {"role": "user", "content": "pending reset before mismatch"},
+            token_estimate=13,
+            source="telegram",
+        )
+        engine._dag.add_node(SummaryNode(
+            session_id="bound-after-reset",
+            depth=0,
+            summary="will be pruned on reset",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = store_id
+        old_conversation_id = engine._conversation_id
+
+        engine.on_session_reset()
+        assert engine._pending_reset_session_id == "bound-after-reset"
+
+        engine.on_session_start(
+            "new-after-mismatch",
+            boundary_reason="compression",
+            old_session_id="stale-host-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        old_state = engine._lifecycle.get_by_conversation(old_conversation_id)
+        assert old_state is not None
+        assert old_state.current_session_id is None
+        assert old_state.last_finalized_session_id == "bound-after-reset"
+        assert old_state.last_finalized_frontier_store_id == store_id
+        assert engine._pending_reset_session_id == ""
 
     def test_on_session_start_recovers_durable_lifecycle_state_after_restart(self, engine, monkeypatch):
         engine.on_session_start("active-session", platform="cli", context_length=200000)
@@ -2240,12 +6691,366 @@ class TestAssemblyGuardrails:
         assert result == messages
 
 
+class TestAssemblyToolPairGuardrail:
+    """Regression: active context must return provider-valid tool sequences."""
+
+    def _make_engine(self, tmp_path, db_name="lcm_tool_pairs.db"):
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / db_name),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "tool-pair-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+        return instance
+
+    def _assert_provider_tool_sequence_valid(self, messages):
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") == "tool":
+                raise AssertionError(f"bare/late tool result at index {i}: {msg!r}")
+
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                expected_ids = [
+                    str((tool_call or {}).get("id") or (tool_call or {}).get("tool_call_id") or "").strip()
+                    for tool_call in (msg.get("tool_calls") or [])
+                    if isinstance(tool_call, dict)
+                ]
+                expected_ids = [call_id for call_id in expected_ids if call_id]
+
+                for offset, expected_id in enumerate(expected_ids, start=1):
+                    assert i + offset < len(messages), (
+                        f"missing direct tool result for {expected_id} after assistant index {i}"
+                    )
+                    tool_msg = messages[i + offset]
+                    assert tool_msg.get("role") == "tool", (
+                        f"expected tool result for {expected_id} at index {i + offset}, got {tool_msg!r}"
+                    )
+                    assert str(tool_msg.get("tool_call_id") or "").strip() == expected_id
+
+                i += 1 + len(expected_ids)
+                continue
+
+            i += 1
+
+    def test_assemble_removes_orphan_tool_result(self, tmp_path):
+        """When a tool result references a call_id whose assistant tool_call
+        was removed (e.g., compacted by LCM), the assembled active context
+        must not contain that orphan tool result."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_orphan.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "orphan-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        sys_msg = {"role": "system", "content": "You are helpful."}
+        # Simulate real-world shape: assistant summary replaced the original
+        # tool_call, leaving an orphan tool result in the fresh tail.
+        tail_messages = [
+            {"role": "assistant", "content": "[Session Arc Summary] ..."},
+            {"role": "tool", "tool_call_id": "call_orphan_x", "content": "orphan result"},
+            {"role": "assistant", "tool_calls": [{"id": "call_ok", "function": {"name": "patch", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_ok", "content": "patch result"},
+            {"role": "assistant", "content": "Done."},
+        ]
+
+        result = instance._assemble_context(sys_msg, tail_messages)
+
+        # The orphan tool result (call_orphan_x) must be removed
+        orphan_ids = [
+            m.get("tool_call_id") for m in result
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_orphan_x"
+        ]
+        assert len(orphan_ids) == 0, f"Orphan tool result still present: {orphan_ids}"
+
+    def test_assemble_inserts_stub_for_missing_tool_result(self, tmp_path):
+        """When an assistant tool_call has no matching tool result in the
+        assembled context, a stub result must be inserted."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_stub.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "stub-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        sys_msg = {"role": "system", "content": "You are helpful."}
+        tail_messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_no_result", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "assistant", "content": "Continuing..."},
+        ]
+
+        result = instance._assemble_context(sys_msg, tail_messages)
+
+        # There must be a stub tool result for call_no_result
+        stub_ids = [
+            m.get("tool_call_id") for m in result
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_no_result"
+        ]
+        assert len(stub_ids) >= 1, f"No stub result for assistant tool_call: {stub_ids}"
+
+    def test_compress_output_is_valid_tool_pair_sequence(self, tmp_path, monkeypatch):
+        """Full compress() output must not contain orphan tool results
+        and must include stubs for missing results."""
+        import importlib
+        esc_module = importlib.import_module("hermes_lcm.escalation")
+        engine_module = importlib.import_module("hermes_lcm.engine")
+
+        config = LCMConfig(
+            fresh_tail_count=4,
+            database_path=str(tmp_path / "lcm_compress_pair.db"),
+            leaf_chunk_tokens=200,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "compress-pair-test"
+        instance.context_length = 200000
+        instance.threshold_tokens = 500
+
+        def mock_summary(**kwargs):
+            return "Leaf summary.\nExpand for details about: test", 1
+
+        monkeypatch.setattr(esc_module, "summarize_with_escalation", mock_summary)
+
+        messages = [{"role": "system", "content": "You are helpful."}]
+        # Build a conversation where an assistant tool_call gets compacted
+        # but its tool result might survive into the fresh tail.
+        messages.append({"role": "user", "content": "Q0: " + "x" * 200})
+        # This assistant tool_call + result pair will be compacted:
+        messages.append({"role": "assistant", "tool_calls": [{"id": "call_compacted", "function": {"name": "terminal", "arguments": "{}"}}]})
+        messages.append({"role": "tool", "tool_call_id": "call_compacted", "content": "result that gets compacted"})
+        # More filler to push the pair into the raw backlog:
+        for i in range(1, 10):
+            messages.append({"role": "user", "content": f"Q{i}: " + "y" * 200})
+            messages.append({"role": "assistant", "content": f"A{i}: " + "z" * 200})
+
+        result = instance.compress(messages)
+
+        # After compression, no orphan tool results
+        assistant_ids = set()
+        for m in result:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m.get("tool_calls") or []:
+                    cid = tc.get("id") if isinstance(tc, dict) else ""
+                    if cid:
+                        assistant_ids.add(cid)
+        result_ids = set()
+        for m in result:
+            if m.get("role") == "tool" and m.get("tool_call_id"):
+                result_ids.add(m.get("tool_call_id"))
+        orphaned = result_ids - assistant_ids
+        assert len(orphaned) == 0, f"Orphan tool results after compress: {orphaned}"
+        # And no missing results (every assistant call has a result or stub)
+        missing = assistant_ids - result_ids
+        # Missing results should have stubs — verify they exist
+        for cid in missing:
+            stub_found = any(
+                m.get("role") == "tool" and m.get("tool_call_id") == cid
+                for m in result
+            )
+            assert stub_found, f"Missing stub for tool_call_id {cid}"
+
+    def test_overflow_recovery_fallback_removes_orphan_tool_result(self, tmp_path):
+        """Overflow recovery fallback must not return a bare orphan tool result."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_overflow_orphan.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "overflow-orphan-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        sys_msg = {"role": "system", "content": "sys"}
+        tail_messages = [
+            {"role": "user", "content": "u" * 200},
+            {"role": "tool", "tool_call_id": "call_orphan", "content": "orphan tool result"},
+        ]
+
+        result = instance._assemble_overflow_recovery_context(
+            sys_msg,
+            tail_messages,
+            assembly_cap_override=1,
+        )
+
+        orphan_ids = [
+            m.get("tool_call_id") for m in result
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_orphan"
+        ]
+        assert len(orphan_ids) == 0, f"Overflow fallback leaked orphan tool result: {orphan_ids}"
+
+    def test_overflow_recovery_fallback_inserts_stub_for_missing_tool_result(self, tmp_path):
+        """Overflow recovery fallback must sanitize an assistant tool_call-only tail."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_overflow_stub.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "overflow-stub-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        sys_msg = {"role": "system", "content": "sys"}
+        tail_messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_missing", "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+        ]
+
+        result = instance._assemble_overflow_recovery_context(
+            sys_msg,
+            tail_messages,
+            assembly_cap_override=1,
+        )
+
+        stub_ids = [
+            m.get("tool_call_id") for m in result
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_missing"
+        ]
+        assert len(stub_ids) >= 1, f"Overflow fallback missing stub tool result: {stub_ids}"
+
+    def test_sanitize_tool_pairs_is_idempotent(self, tmp_path):
+        """Applying the helper twice must not change the result again."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_idempotent.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "idempotent-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_once", "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+            {"role": "assistant", "content": "after"},
+        ]
+
+        once = instance._sanitize_tool_pairs([dict(m) for m in messages])
+        twice = instance._sanitize_tool_pairs([dict(m) for m in once])
+        assert once == twice
+
+    def test_sanitize_tool_pairs_keeps_valid_sequence_unchanged(self, tmp_path):
+        """A valid tool-call/result sequence must be preserved as-is."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_valid_unchanged.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "valid-unchanged-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_ok", "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_ok", "content": "ok"},
+            {"role": "assistant", "content": "done"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+        assert result == messages
+        self._assert_provider_tool_sequence_valid(result)
+
+    def test_sanitize_tool_pairs_drops_late_tool_result_after_intervening_message(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_late_tool_result.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_late", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "user", "content": "intervening turn"},
+            {"role": "tool", "tool_call_id": "call_late", "content": "late result"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        self._assert_provider_tool_sequence_valid(result)
+        assert result[1]["role"] == "tool"
+        assert result[1]["tool_call_id"] == "call_late"
+        assert "earlier conversation" in result[1]["content"]
+        assert all(msg.get("content") != "late result" for msg in result)
+
+    def test_sanitize_tool_pairs_drops_duplicate_late_result(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_duplicate_tool_result.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_dup", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_dup", "content": "direct result"},
+            {"role": "assistant", "content": "done"},
+            {"role": "tool", "tool_call_id": "call_dup", "content": "duplicate late result"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        self._assert_provider_tool_sequence_valid(result)
+        assert [msg.get("content") for msg in result].count("direct result") == 1
+        assert all(msg.get("content") != "duplicate late result" for msg in result)
+
+    def test_sanitize_tool_pairs_keeps_ordered_parallel_results(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_parallel_ordered.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_a", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "call_b", "function": {"name": "terminal", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+            {"role": "assistant", "content": "done"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        assert result == messages
+        self._assert_provider_tool_sequence_valid(result)
+
+    def test_sanitize_tool_pairs_replaces_out_of_order_parallel_results_with_stubs(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_parallel_out_of_order.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_a", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "call_b", "function": {"name": "terminal", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B out of order"},
+            {"role": "tool", "tool_call_id": "call_a", "content": "A out of order"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        self._assert_provider_tool_sequence_valid(result)
+        assert [msg.get("tool_call_id") for msg in result[1:3]] == ["call_a", "call_b"]
+        assert result[1]["content"] == "A out of order"
+        assert "earlier conversation" in result[2]["content"]
+        assert all(msg.get("content") != "B out of order" for msg in result)
+
+
 class TestEngineTools:
     def test_handle_grep(self, engine):
         # Add some data
         engine._store.append("test-session", {"role": "user", "content": "deploy docker containers"})
         result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "docker"}))
         assert "results" in result
+
+    def test_handle_grep_unbound_current_session_does_not_search_all_sessions(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "unbound-current-session.db"))
+        instance = LCMEngine(config=config)
+        assert instance._session_id == ""
+        instance._store.append("session-a", {"role": "user", "content": "docker from session a"})
+        instance._store.append("session-b", {"role": "user", "content": "docker from session b"})
+
+        result = json.loads(instance.handle_tool_call("lcm_grep", {"query": "docker", "limit": 10}))
+
+        assert result["session_scope"] == "current"
+        assert result["total_results"] == 0
+        assert result["results"] == []
 
     def test_handle_grep_reports_sort_mode(self, engine):
         engine._store.append(
@@ -2259,6 +7064,45 @@ class TestEngineTools:
             )
         )
         assert result["sort"] == "relevance"
+
+    def test_handle_grep_session_scope_all_returns_cross_session_hits(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker rollout current session"})
+        engine._store.append("old-session", {"role": "user", "content": "docker rollout old session"})
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "all", "limit": 10},
+            )
+        )
+
+        assert result["session_scope"] == "all"
+        assert result["total_results"] == 2
+        session_ids = {hit["session_id"] for hit in result["results"]}
+        assert session_ids == {"test-session", "old-session"}
+        from_current_flags = {
+            hit["session_id"]: hit["from_current_session"] for hit in result["results"]
+        }
+        assert from_current_flags == {"test-session": True, "old-session": False}
+        # No ignored_session_scope key when the requested scope is now supported.
+        assert "ignored_session_scope" not in result
+
+    def test_handle_grep_truly_unknown_session_scope_stays_current_and_reports(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker rollout current session"})
+        engine._store.append("old-session", {"role": "user", "content": "docker rollout old session"})
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "everything", "limit": 10},
+            )
+        )
+
+        assert result["session_scope"] == "current"
+        assert result["ignored_session_scope"] == "everything"
+        assert "current" in result["scope_note"]
+        assert result["total_results"] == 1
+        assert result["results"][0]["session_id"] == "test-session"
 
     def test_handle_grep_source_filter_in_current_session_includes_only_matching_summaries(self, engine):
         engine._store.append("test-session", {"role": "user", "content": "docker logs from discord"}, source="discord")
@@ -2394,6 +7238,45 @@ class TestEngineTools:
             "unknown summary" in item.get("snippet", "")
             for item in result["results"]
             if item["type"] == "summary"
+        )
+
+    def test_handle_grep_unknown_source_filter_matches_whitespace_legacy_summary_lineage(self, engine):
+        cursor = engine._store._conn.execute(
+            """INSERT INTO messages
+               (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("test-session", "\t\n", "user", "docker logs from whitespace legacy source", None, None, None, 1.0, 5, 0),
+        )
+        legacy_store_id = cursor.lastrowid
+        engine._store._conn.commit()
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="whitespace legacy summary about docker logs",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[legacy_store_id],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "current", "source": "unknown", "limit": 10},
+            )
+        )
+
+        assert result["source"] == "unknown"
+        assert any(
+            item["type"] == "message" and item.get("source") == "unknown"
+            for item in result["results"]
+        )
+        assert any(
+            item["type"] == "summary" and "whitespace legacy summary" in item.get("snippet", "")
+            for item in result["results"]
         )
 
     def test_handle_grep_prefers_conversational_hits_over_tool_output_noise(self, engine):
@@ -3001,6 +7884,335 @@ class TestEngineTools:
         assert "session_id" in result
         assert "store_message_count" in result
 
+    def test_handle_expand_paginates_message_sources_with_cursor_metadata(self, engine):
+        store_ids = [
+            engine._store.append(
+                "test-session",
+                {"role": "user", "content": f"raw page message {idx}"},
+            )
+            for idx in range(5)
+        ]
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Paged raw source summary",
+                token_count=10,
+                source_token_count=50,
+                source_ids=store_ids,
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"node_id": node_id, "source_offset": 1, "source_limit": 2, "max_tokens": 1000},
+            )
+        )
+
+        assert [item["store_id"] for item in result["expanded"]] == store_ids[1:3]
+        assert [item["source_index"] for item in result["expanded"]] == [1, 2]
+        assert result["pagination"] == {
+            "source_offset": 1,
+            "content_offset": 0,
+            "source_limit": 2,
+            "returned_sources": 2,
+            "total_sources": 5,
+            "next_source_offset": 3,
+            "next_content_offset": 0,
+            "has_more": True,
+            "remaining_sources": 2,
+        }
+
+    def test_handle_expand_paginates_oversized_message_content_without_losing_raw_tail(self, engine):
+        from hermes_lcm.tokens import count_tokens
+
+        content = "alpha " * 400
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": content},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Oversized raw message summary",
+                token_count=10,
+                source_token_count=count_tokens(content),
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        first = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"node_id": node_id, "max_tokens": 20},
+            )
+        )
+
+        first_item = first["expanded"][0]
+        assert first_item["store_id"] == store_id
+        assert first_item["content_offset"] == 0
+        assert first_item["content_truncated"] is True
+        assert count_tokens(first_item["content"]) <= 20
+        assert first["pagination"]["has_more"] is True
+        assert first["pagination"]["next_source_offset"] == 0
+        assert first["pagination"]["next_content_offset"] > 0
+
+        second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "node_id": node_id,
+                    "source_offset": first["pagination"]["next_source_offset"],
+                    "content_offset": first["pagination"]["next_content_offset"],
+                    "max_tokens": 20,
+                },
+            )
+        )
+
+        assert second["expanded"][0]["content_offset"] == first["pagination"]["next_content_offset"]
+        assert second["expanded"][0]["content"] == content[first["pagination"]["next_content_offset"]:][:len(second["expanded"][0]["content"])]
+
+    def test_handle_expand_advances_content_cursor_when_budget_cannot_fit_character(self, engine, monkeypatch):
+        import hermes_lcm.tokens as token_utils
+
+        def fake_count_tokens(text):
+            return 0 if not text else len(text) + 1
+
+        monkeypatch.setattr(token_utils, "count_tokens", fake_count_tokens)
+        content = "abcdef"
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": content},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Tiny budget raw message summary",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        first = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id, "max_tokens": 1}))
+
+        assert first["expanded"][0]["content"] == "a"
+        assert first["expanded"][0]["content_offset"] == 0
+        assert first["expanded"][0]["next_content_offset"] == 1
+        assert first["pagination"]["has_more"] is True
+        assert first["pagination"]["next_source_offset"] == 0
+        assert first["pagination"]["next_content_offset"] == 1
+
+        second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "node_id": node_id,
+                    "source_offset": first["pagination"]["next_source_offset"],
+                    "content_offset": first["pagination"]["next_content_offset"],
+                    "max_tokens": 1,
+                },
+            )
+        )
+
+        assert second["expanded"][0]["content"] == "b"
+        assert second["expanded"][0]["content_offset"] == 1
+        assert second["pagination"]["next_content_offset"] == 2
+
+    def test_handle_expand_query_advances_content_cursor_when_context_budget_cannot_fit_character(self, engine, monkeypatch):
+        import hermes_lcm.tokens as token_utils
+
+        captured = {}
+
+        def fake_count_tokens(text):
+            return 0 if not text else len(text) + 1
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(token_utils, "count_tokens", fake_count_tokens)
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "abcdef"},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="",
+                token_count=0,
+                source_token_count=10,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What raw detail?",
+                    "node_ids": [node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 1,
+                },
+            )
+        )
+
+        message_block = next(block for block in captured["context_blocks"] if block["type"] == "messages")
+        assert message_block["messages"][0]["content"] == "a"
+        assert message_block["messages"][0]["next_content_offset"] == 1
+        assert result["context_truncated"] is True
+        assert any(
+            item["node_id"] == node_id
+            and item.get("pagination", {}).get("next_content_offset") == 1
+            for item in result["context_pagination"]
+        )
+
+    def test_handle_expand_paginates_child_node_sources(self, engine):
+        child_ids = []
+        for idx in range(3):
+            store_id = engine._store.append(
+                "test-session",
+                {"role": "user", "content": f"child node raw {idx}"},
+            )
+            child_ids.append(
+                engine._dag.add_node(
+                    SummaryNode(
+                        session_id="test-session",
+                        depth=0,
+                        summary=f"child summary {idx}",
+                        token_count=10,
+                        source_token_count=10,
+                        source_ids=[store_id],
+                        source_type="messages",
+                        created_at=idx,
+                    )
+                )
+            )
+        parent_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary="parent summary",
+                token_count=10,
+                source_token_count=30,
+                source_ids=child_ids,
+                source_type="nodes",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"node_id": parent_id, "source_offset": 1, "source_limit": 1},
+            )
+        )
+
+        assert result["source_type"] == "nodes"
+        assert [item["node_id"] for item in result["expanded"]] == [child_ids[1]]
+        assert result["expanded"][0]["source_index"] == 1
+        assert result["pagination"]["has_more"] is True
+        assert result["pagination"]["next_source_offset"] == 2
+
+    def test_handle_expand_child_node_pagination_preserves_source_id_order(self, engine):
+        newer_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="newer child in source order first",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[],
+                source_type="messages",
+                created_at=2,
+            )
+        )
+        older_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="older child in source order second",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[],
+                source_type="messages",
+                created_at=1,
+            )
+        )
+        parent_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary="parent summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[newer_id, older_id],
+                source_type="nodes",
+                created_at=3,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"node_id": parent_id, "source_offset": 0, "source_limit": 1},
+            )
+        )
+
+        assert [item["node_id"] for item in result["expanded"]] == [newer_id]
+        assert result["expanded"][0]["source_index"] == 0
+
+    def test_handle_expand_child_node_sources_respect_max_tokens(self, engine):
+        child_ids = []
+        for idx in range(2):
+            child_ids.append(
+                engine._dag.add_node(
+                    SummaryNode(
+                        session_id="test-session",
+                        depth=0,
+                        summary=(f"child {idx} " * 80),
+                        token_count=160,
+                        source_token_count=160,
+                        source_ids=[],
+                        source_type="messages",
+                        created_at=idx,
+                    )
+                )
+            )
+        parent_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary="parent summary",
+                token_count=10,
+                source_token_count=320,
+                source_ids=child_ids,
+                source_type="nodes",
+                created_at=3,
+            )
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": parent_id, "max_tokens": 5}))
+
+        assert len(result["expanded"]) == 1
+        assert result["expanded"][0]["summary_truncated"] is True
+        assert result["pagination"]["has_more"] is True
+        assert result["pagination"]["next_source_offset"] == 1
+
     def test_handle_expand_includes_externalized_metadata_for_large_tool_result_sources(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_externalized_expand.db"),
@@ -3188,6 +8400,505 @@ class TestEngineTools:
         assert result["content_truncated"] is True
         assert count_tokens(result["content"]) <= 10
         assert result["tool_call_id"] == "call_big"
+
+    def test_handle_expand_externalized_ref_uses_content_offset_cursor(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_externalized_payload_cursor.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_big", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+
+        first = json.loads(engine.handle_tool_call("lcm_expand", {"externalized_ref": ref, "max_tokens": 10}))
+        assert first["has_more"] is True
+        assert first["next_content_offset"] > 0
+
+        second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "externalized_ref": ref,
+                    "content_offset": first["next_content_offset"],
+                    "max_tokens": 10,
+                },
+            )
+        )
+
+        assert second["content_offset"] == first["next_content_offset"]
+        assert second["content"] == content[first["next_content_offset"]:][:len(second["content"])]
+
+    def test_handle_expand_externalized_ref_advances_content_cursor_when_budget_cannot_fit_character(self, tmp_path, monkeypatch):
+        import hermes_lcm.tokens as token_utils
+
+        def fake_count_tokens(text):
+            return 0 if not text else len(text) + 1
+
+        monkeypatch.setattr(token_utils, "count_tokens", fake_count_tokens)
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_externalized_payload_tiny_cursor.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=2,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        content = "abcdef"
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_tiny", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+
+        first = json.loads(engine.handle_tool_call("lcm_expand", {"externalized_ref": ref, "max_tokens": 1}))
+
+        assert first["content"] == "a"
+        assert first["content_offset"] == 0
+        assert first["next_content_offset"] == 1
+        assert first["has_more"] is True
+
+        second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "externalized_ref": ref,
+                    "content_offset": first["next_content_offset"],
+                    "max_tokens": 1,
+                },
+            )
+        )
+
+        assert second["content"] == "b"
+        assert second["content_offset"] == 1
+        assert second["next_content_offset"] == 2
+
+    def test_handle_expand_query_uses_independent_context_budget_for_auxiliary_retrieval(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            captured["max_tokens"] = max_tokens
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        first_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "first filler " * 80},
+        )
+        second_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "SECOND RAW DETAIL survives auxiliary context expansion"},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Summary mentioning second raw detail",
+                token_count=10,
+                source_token_count=200,
+                source_ids=[first_store_id, second_store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What detail survived?",
+                    "node_ids": [node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 500,
+                },
+            )
+        )
+
+        assert result["answer"] == "bounded answer"
+        assert captured["max_tokens"] == 5
+        context_json = json.dumps(captured["context_blocks"])
+        assert "SECOND RAW DETAIL" in context_json
+
+    def test_handle_expand_query_applies_context_budget_globally_across_nodes(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        first_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "first filler " * 80},
+        )
+        first_node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="first summary",
+                token_count=10,
+                source_token_count=200,
+                source_ids=[first_store_id],
+                source_type="messages",
+                created_at=2,
+            )
+        )
+        second_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "SECOND NODE RAW DETAIL should require another page"},
+        )
+        second_node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="second summary without raw detail",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[second_store_id],
+                source_type="messages",
+                created_at=1,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What raw details exist?",
+                    "node_ids": [first_node_id, second_node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 1,
+                },
+            )
+        )
+
+        context_json = json.dumps(captured["context_blocks"])
+        assert "SECOND NODE RAW DETAIL" not in context_json
+        assert result["context_truncated"] is True
+        assert any(
+            item["node_id"] == second_node_id and item.get("pagination", {}).get("has_more")
+            for item in result["context_pagination"]
+        )
+
+    def test_handle_expand_query_counts_summary_blocks_against_context_budget(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "raw detail should wait behind summary budget"},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary=("long summary filler " * 80) + "UNBUDGETED SUMMARY TAIL",
+                token_count=200,
+                source_token_count=20,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What fits?",
+                    "node_ids": [node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 5,
+                },
+            )
+        )
+
+        context_json = json.dumps(captured["context_blocks"])
+        assert "UNBUDGETED SUMMARY TAIL" not in context_json
+        assert "raw detail should wait" not in context_json
+        assert captured["context_blocks"][0]["summary_truncated"] is True
+        assert result["context_truncated"] is True
+        assert any(
+            item["node_id"] == node_id and item["type"] == "summary"
+            for item in result["context_pagination"]
+        )
+
+    def test_handle_expand_query_reports_last_child_summary_truncation_in_context_pagination(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        child_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary=("child summary detail " * 80) + "CHILD SUMMARY TAIL",
+                token_count=200,
+                source_token_count=200,
+                source_ids=[],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+        parent_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary="",
+                token_count=0,
+                source_token_count=200,
+                source_ids=[child_id],
+                source_type="nodes",
+                created_at=1,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What child details fit?",
+                    "node_ids": [parent_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 5,
+                },
+            )
+        )
+
+        context_json = json.dumps(captured["context_blocks"])
+        assert "CHILD SUMMARY TAIL" not in context_json
+        child_block = next(block for block in captured["context_blocks"] if block["type"] == "child_nodes")
+        assert child_block["children"][0]["summary_truncated"] is True
+        assert result["context_truncated"] is True
+        assert any(
+            item["type"] == "child_summary"
+            and item["node_id"] == parent_id
+            and item["child_node_id"] == child_id
+            and item["summary_truncated"] is True
+            and item["expand_args"] == {"node_id": child_id}
+            for item in result["context_pagination"]
+        )
+
+    def test_handle_expand_query_externalized_truncation_returns_ref_in_context_pagination(self, tmp_path, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_expand_query_externalized_truncated.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        content = "EXTERNALIZED RAW DETAIL " + ("abcdef" * 1000)
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_ext", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+        placeholder = f"[GC'd externalized tool output: tool_call_id=call_ext; chars={len(content)}; ref={ref}]"
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "tool", "tool_call_id": "call_ext", "content": placeholder},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="externalized payload summary",
+                token_count=10,
+                source_token_count=200,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What externalized detail exists?",
+                    "node_ids": [node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 20,
+                },
+            )
+        )
+
+        message_block = next(block for block in captured["context_blocks"] if block["type"] == "messages")
+        assert message_block["messages"][0]["content_source"] == "externalized_payload"
+        assert message_block["messages"][0]["content_truncated"] is True
+        assert result["context_truncated"] is True
+        assert any(
+            item["type"] == "messages"
+            and item["node_id"] == node_id
+            and item["content_source"] == "externalized_payload"
+            and item["externalized_ref"] == ref
+            and item["pagination"]["has_more"] is True
+            and item["expand_args"] == {
+                "externalized_ref": ref,
+                "content_offset": item["pagination"]["next_content_offset"],
+            }
+            for item in result["context_pagination"]
+        )
+
+    def test_handle_expand_query_counts_externalized_transcript_content_against_context_budget(self, tmp_path, monkeypatch):
+        import hermes_lcm.tokens as token_utils
+
+        captured = {}
+
+        def fake_count_tokens(text):
+            return len(str(text or ""))
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(token_utils, "count_tokens", fake_count_tokens)
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_expand_query_externalized_transcript_budget.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=2,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        content = "PAYLOAD"
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_ext", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+        transcript_content = (
+            f"[GC'd externalized tool output: tool_call_id=call_ext; chars={len(content)}; ref={ref}]"
+            + (" transcript filler" * 20)
+        )
+        first_store_id = engine._store.append(
+            "test-session",
+            {"role": "tool", "tool_call_id": "call_ext", "content": transcript_content},
+        )
+        first_node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="",
+                token_count=0,
+                source_token_count=200,
+                source_ids=[first_store_id],
+                source_type="messages",
+                created_at=1,
+            )
+        )
+        second_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "SECOND_RAW_DETAIL"},
+        )
+        second_node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="",
+                token_count=0,
+                source_token_count=20,
+                source_ids=[second_store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What details fit?",
+                    "node_ids": [first_node_id, second_node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 30,
+                },
+            )
+        )
+
+        context_json = json.dumps(captured["context_blocks"])
+        assert "transcript_content" in context_json
+        assert "SECOND_RAW_DETAIL" not in context_json
+        assert result["context_truncated"] is True
+        assert any(
+            item["node_id"] == second_node_id
+            and item["type"] == "messages"
+            and item.get("pagination", {}).get("has_more") is True
+            and item.get("expand_args") == {"node_id": second_node_id, "source_offset": 0, "content_offset": 0}
+            for item in result["context_pagination"]
+        )
+
+    def test_handle_expand_query_hydrates_externalized_payload_content_for_auxiliary_context(self, tmp_path, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_expand_query_externalized.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        content = "EXTERNALIZED RAW DETAIL survives for auxiliary retrieval " + ("abcdef" * 100)
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_ext", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+        placeholder = f"[GC'd externalized tool output: tool_call_id=call_ext; chars={len(content)}; ref={ref}]"
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "tool", "tool_call_id": "call_ext", "content": placeholder},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="externalized payload summary",
+                token_count=10,
+                source_token_count=200,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What externalized detail exists?",
+                    "node_ids": [node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 500,
+                },
+            )
+        )
+
+        context_json = json.dumps(captured["context_blocks"])
+        assert "EXTERNALIZED RAW DETAIL" in context_json
+        assert "externalized_payload" in context_json
+        assert result["context_truncated"] is False
 
     def test_compress_gc_rewrites_summarized_externalized_tool_results(self, tmp_path, monkeypatch):
         config = LCMConfig(
@@ -3437,6 +9148,130 @@ class TestEngineTools:
         assert seen["prompt"] == "What was the plan?"
         assert seen["context_blocks"]
 
+    def test_handle_expand_query_timeout_returns_explicit_degraded_error(self, engine, monkeypatch):
+        engine._config.expansion_timeout_ms = 2500
+        engine._store.append("test-session", {"role": "user", "content": "Discussed docker rollout plan"})
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Docker rollout summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[1],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            raise TimeoutError("expansion timed out")
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"query": "docker", "prompt": "What was the plan?"},
+            )
+        )
+
+        assert result["degraded"] is True
+        assert "timed out" in result["error"]
+        assert result["timeout_seconds"] == 2.5
+        assert result["node_ids"] == [node_id]
+        assert result["matches"]
+        assert "answer" not in result
+
+    def test_handle_expand_query_unexpected_synthesis_error_is_not_degraded(self, engine, monkeypatch):
+        engine._store.append("test-session", {"role": "user", "content": "Discussed docker rollout plan"})
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Docker rollout summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[1],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            raise RuntimeError("schema bug")
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+
+        with pytest.raises(RuntimeError, match="schema bug"):
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"query": "docker", "prompt": "What was the plan?"},
+            )
+
+    def test_handle_expand_query_blank_synthesis_is_not_false_success(self, engine, monkeypatch):
+        engine._store.append("test-session", {"role": "user", "content": "Discussed docker rollout plan"})
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Docker rollout summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[1],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", lambda **kwargs: "   ")
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"query": "docker", "prompt": "What was the plan?"},
+            )
+        )
+
+        assert result["degraded"] is True
+        assert "empty answer" in result["error"]
+        assert result["node_ids"] == [node_id]
+        assert result["matches"]
+        assert "answer" not in result
+
+    def test_handle_expand_query_node_ids_timeout_preserves_requested_match(self, engine, monkeypatch):
+        engine._store.append("test-session", {"role": "user", "content": "Discussed docker rollout plan"})
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Docker rollout summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[1],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            raise TimeoutError("expansion timed out")
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"node_ids": [node_id], "prompt": "What was the plan?"},
+            )
+        )
+
+        assert result["degraded"] is True
+        assert "timed out" in result["error"]
+        assert result["query"] == ""
+        assert result["node_ids"] == [node_id]
+        assert result["matches"][0]["node_id"] == node_id
+        assert "answer" not in result
+
     def test_handle_expand_query_hyphenated_operator_query_falls_back_cleanly(self, engine, monkeypatch):
         engine._store.append(
             "test-session",
@@ -3633,18 +9468,44 @@ class TestEngineTools:
         assert result["overall"] == "healthy"
         check_names = [c["check"] for c in result["checks"]]
         assert "database_integrity" in check_names
+        assert "messages_fts_integrity" in check_names
+        assert "nodes_fts_integrity" in check_names
         assert "fts_index_sync" in check_names
         assert "orphaned_dag_nodes" in check_names
         assert "config_validation" in check_names
         assert all(c["status"] == "pass" for c in result["checks"])
 
+    def test_handle_doctor_reports_fts_integrity_failures_separately(self, engine, monkeypatch):
+        def fake_fts_integrity(_conn, spec):
+            if spec.table_name == "nodes_fts":
+                return {
+                    "status": "fail",
+                    "detail": "malformed inverted index for FTS5 table main.nodes_fts",
+                }
+            return {"status": "pass", "detail": "ok"}
+
+        monkeypatch.setattr(lcm_tools, "check_external_content_fts_integrity", fake_fts_integrity)
+
+        result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+        checks = {check["check"]: check for check in result["checks"]}
+        assert result["overall"] == "unhealthy"
+        assert checks["database_integrity"]["status"] == "pass"
+        assert checks["messages_fts_integrity"]["status"] == "pass"
+        assert checks["nodes_fts_integrity"] == {
+            "check": "nodes_fts_integrity",
+            "status": "fail",
+            "detail": "malformed inverted index for FTS5 table main.nodes_fts",
+        }
+
     def test_handle_doctor_treats_legacy_blank_source_rows_as_healthy(self, engine):
-        engine._store._conn.execute(
-            """INSERT INTO messages
-               (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("legacy-session", "", "user", "legacy blank source", None, None, None, 1.0, 5, 0),
-        )
+        for source in (None, "", "   ", "\t\n"):
+            engine._store._conn.execute(
+                """INSERT INTO messages
+                   (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("legacy-session", source, "user", "legacy blank source", None, None, None, 1.0, 5, 0),
+            )
         engine._store._conn.commit()
 
         result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
@@ -3652,7 +9513,138 @@ class TestEngineTools:
         assert result["overall"] == "healthy"
         lineage_check = next(c for c in result["checks"] if c["check"] == "source_lineage_hygiene")
         assert lineage_check["status"] == "pass"
-        assert lineage_check["detail"]["legacy_blank_source_messages"] == 1
+        assert lineage_check["detail"]["legacy_blank_source_messages"] == 4
+        assert lineage_check["detail"]["effective_unknown_messages"] == 4
+
+    def test_handle_doctor_reports_lifecycle_fragmentation_without_mutating(self, engine, tmp_path):
+        engine._hermes_home = str(tmp_path / "hermes_home")
+        state_db = tmp_path / "hermes_home" / "state.db"
+        state_db.parent.mkdir(parents=True, exist_ok=True)
+        state_conn = sqlite3.connect(state_db)
+        state_conn.executescript(
+            """
+            CREATE TABLE sessions (id TEXT PRIMARY KEY);
+            INSERT INTO sessions(id) VALUES ('current-with-message');
+            INSERT INTO sessions(id) VALUES ('state-only');
+            """
+        )
+        state_conn.commit()
+        state_conn.close()
+        engine._store.append("current-with-message", {"role": "user", "content": "covered"}, source="cli")
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="node-missing-in-state",
+                depth=0,
+                summary="summary-only coverage",
+                token_count=5,
+                source_token_count=5,
+                source_ids=[],
+                source_type="messages",
+                created_at=1.0,
+            )
+        )
+        engine._lifecycle._conn.execute(
+            """INSERT INTO lcm_lifecycle_state
+               (conversation_id, current_session_id, last_finalized_session_id, current_frontier_store_id, last_finalized_frontier_store_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("conv-current", "current-with-message", "node-missing-in-state", 0, 0, 1.0),
+        )
+        engine._lifecycle._conn.execute(
+            """INSERT INTO lcm_lifecycle_state
+               (conversation_id, current_session_id, last_finalized_session_id, current_frontier_store_id, last_finalized_frontier_store_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            ("conv-stale", "missing-current", "missing-final", 0, 0, 1.0),
+        )
+        engine._lifecycle._conn.commit()
+
+        result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+        lifecycle_check = next(c for c in result["checks"] if c["check"] == "lifecycle_fragmentation")
+        assert lifecycle_check["status"] == "warn"
+        assert lifecycle_check["detail"]["lifecycle_rows"] == 2
+        assert lifecycle_check["detail"]["lifecycle_current_missing_in_lcm_any"] == 1
+        assert lifecycle_check["detail"]["lifecycle_current_missing_in_state"] == 1
+        assert lifecycle_check["detail"]["lcm_node_sessions_missing_in_state"] == 1
+        assert lifecycle_check["detail"]["state_sessions_missing_in_lcm_any"] == 1
+        assert lifecycle_check["detail"]["read_only"] is True
+        assert engine._lifecycle.row_count() == 2
+
+    def test_handle_doctor_warns_when_existing_state_db_is_unreadable(self, engine, tmp_path):
+        engine._hermes_home = str(tmp_path / "hermes_home")
+        state_db = tmp_path / "hermes_home" / "state.db"
+        state_db.parent.mkdir(parents=True, exist_ok=True)
+        state_db.write_text("not sqlite")
+
+        result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+        assert result["overall"] == "warnings"
+        lifecycle_check = next(c for c in result["checks"] if c["check"] == "lifecycle_fragmentation")
+        assert lifecycle_check["status"] == "warn"
+        assert lifecycle_check["detail"]["state_db_checked"] is True
+        assert lifecycle_check["detail"]["state_db_error"]
+        assert lifecycle_check["detail"]["read_only"] is True
+
+    def test_handle_doctor_warns_on_message_session_without_lifecycle_current(self, engine):
+        engine.on_session_start("current-session", platform="cli", context_length=200000)
+        engine._store.append("current-session", {"role": "user", "content": "covered"}, source="cli")
+        engine._store.append("message-only-session", {"role": "user", "content": "missing lifecycle"}, source="cli")
+
+        result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+        assert result["overall"] == "warnings"
+        lifecycle_check = next(c for c in result["checks"] if c["check"] == "lifecycle_fragmentation")
+        assert lifecycle_check["status"] == "warn"
+        assert lifecycle_check["detail"]["message_sessions_without_lifecycle_current"] == 1
+        assert lifecycle_check["detail"]["message_sessions_without_lifecycle_reference"] == 1
+        assert lifecycle_check["detail"]["read_only"] is True
+
+    def test_handle_doctor_does_not_warn_on_last_finalized_message_session(self, engine):
+        engine.on_session_start(
+            "current-session",
+            platform="cli",
+            context_length=200000,
+            conversation_id="conversation",
+        )
+        engine._store.append("previous-session", {"role": "user", "content": "previous"}, source="cli")
+        engine._store.append("current-session", {"role": "user", "content": "current"}, source="cli")
+        engine._lifecycle.record_rollover(
+            "conversation",
+            old_session_id="previous-session",
+            new_session_id="current-session",
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+        assert result["overall"] == "healthy"
+        lifecycle_check = next(c for c in result["checks"] if c["check"] == "lifecycle_fragmentation")
+        assert lifecycle_check["status"] == "pass"
+        assert lifecycle_check["detail"]["message_sessions_without_lifecycle_current"] == 1
+        assert lifecycle_check["detail"]["message_sessions_without_lifecycle_reference"] == 0
+        assert lifecycle_check["detail"]["read_only"] is True
+
+    def test_handle_doctor_warns_on_node_session_without_lifecycle_reference(self, engine):
+        engine.on_session_start("current-session", platform="cli", context_length=200000)
+        engine._store.append("current-session", {"role": "user", "content": "covered"}, source="cli")
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="node-only-session",
+                depth=0,
+                summary="missing lifecycle reference",
+                token_count=5,
+                source_token_count=5,
+                source_ids=[],
+                source_type="messages",
+                created_at=1.0,
+            )
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+        assert result["overall"] == "warnings"
+        lifecycle_check = next(c for c in result["checks"] if c["check"] == "lifecycle_fragmentation")
+        assert lifecycle_check["status"] == "warn"
+        assert lifecycle_check["detail"]["node_sessions_without_lifecycle_reference"] == 1
+        assert lifecycle_check["detail"]["read_only"] is True
 
     def test_handle_doctor_warns_on_bad_config(self, tmp_path):
         config = LCMConfig(
@@ -3701,6 +9693,522 @@ class TestEngineTools:
         fts_check = next(c for c in result["checks"] if c["check"] == "fts_index_sync")
         assert fts_check["status"] == "pass"
         assert fts_check["detail"] == "1 session FTS rows, 1 session messages"
+
+
+class TestHandleGrepCrossSession:
+    """Cross-session search via session_scope=all|session and the new filters."""
+
+    def _seed_two_sessions(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker plan current"})
+        engine._store.append("test-session", {"role": "assistant", "content": "docker plan current reply"})
+        engine._store.append("old-session", {"role": "user", "content": "docker plan old"}, source="discord")
+
+    def test_session_scope_all_returns_cross_session_messages(self, engine):
+        self._seed_two_sessions(engine)
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "session_scope": "all"})
+        )
+        assert result["session_scope"] == "all"
+        sessions_seen = {hit["session_id"] for hit in result["results"]}
+        assert sessions_seen == {"test-session", "old-session"}
+        for hit in result["results"]:
+            assert "from_current_session" in hit
+            assert hit["from_current_session"] == (hit["session_id"] == "test-session")
+            assert "timestamp" in hit
+            assert hit["timestamp"] >= 0
+
+    def test_session_scope_session_restricts_to_explicit_id(self, engine):
+        self._seed_two_sessions(engine)
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "session", "session_id": "old-session"},
+            )
+        )
+        assert result["session_scope"] == "session"
+        assert result["session_id"] == "old-session"
+        assert result["total_results"] == 1
+        assert result["results"][0]["session_id"] == "old-session"
+        assert result["results"][0]["from_current_session"] is False
+
+    def test_session_scope_session_without_session_id_returns_error(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "session"},
+            )
+        )
+        assert "error" in result
+        assert "session_id" in result["error"]
+
+    def test_session_scope_current_with_session_id_returns_error(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "current", "session_id": "old-session"},
+            )
+        )
+        assert "error" in result
+        assert "session_id is only valid with session_scope=session" in result["error"]
+
+    def test_session_scope_all_with_session_id_returns_error(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "all", "session_id": "old-session"},
+            )
+        )
+        assert "error" in result
+
+    def test_limit_clamped_at_hard_cap(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker once"})
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "limit": 5000})
+        )
+        assert result["limit"] == 200
+        assert result["limit_clamped_from"] == 5000
+
+    def test_limit_zero_returns_error(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "limit": 0})
+        )
+        assert "error" in result
+        assert "limit" in result["error"]
+
+    def test_limit_negative_returns_error(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "limit": -5})
+        )
+        assert "error" in result
+
+    def test_empty_engine_session_with_unknown_scope_does_not_leak(self, engine):
+        # Regression: unknown session_scope previously fell through to engine._session_id
+        # and returned multi-session rows when the engine was unbound. The fix in #104
+        # makes empty session_id a literal scoped filter at the data layer; the unknown-
+        # scope fallback now routes through current-session and naturally returns zero
+        # results instead of leaking. Mirrors the maintainer's repro from PR #102 review.
+        engine._session_id = ""
+        engine._store.append("session-a", {"role": "user", "content": "docker from a"})
+        engine._store.append("session-b", {"role": "user", "content": "docker from b"})
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "bogus", "limit": 10},
+            )
+        )
+        assert result["session_scope"] == "current"
+        assert result["ignored_session_scope"] == "bogus"
+        assert result["total_results"] == 0
+        assert result["results"] == []
+
+    def test_cross_session_scope_returns_only_message_hits(self, engine):
+        # Cross-session scope intentionally restricts to raw-message hits.
+        # Summary nodes from foreign sessions are excluded entirely (deferred
+        # until a real cross-session DAG-expansion contract exists).
+        engine._store.append("old-session", {"role": "user", "content": "docker old message"})
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="old-session",
+                depth=0,
+                summary="docker old summary",
+                token_count=5,
+                source_token_count=5,
+                source_ids=[1],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "session_scope": "all"})
+        )
+        types_seen = {hit["type"] for hit in result["results"]}
+        assert "message" in types_seen
+        assert "summary" not in types_seen
+        # No summary hits means no cross_session_expand_supported marker is needed.
+        for hit in result["results"]:
+            assert "cross_session_expand_supported" not in hit
+
+    def test_current_scope_still_returns_summary_hits(self, engine):
+        # Regression: removing cross-session summary hits must not affect
+        # current-session DAG search behavior.
+        engine._store.append("test-session", {"role": "user", "content": "docker current"})
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="docker current summary",
+                token_count=5,
+                source_token_count=5,
+                source_ids=[1],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+        result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "docker"}))
+        types_seen = {hit["type"] for hit in result["results"]}
+        assert "summary" in types_seen
+
+    def test_source_filter_combined_with_scope_all(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker via cli"}, source="cli")
+        engine._store.append("old-session", {"role": "user", "content": "docker via discord"}, source="discord")
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "all", "source": "discord"},
+            )
+        )
+        assert result["session_scope"] == "all"
+        assert result["source"] == "discord"
+        assert result["total_results"] == 1
+        assert result["results"][0]["session_id"] == "old-session"
+        assert result["results"][0]["source"] == "discord"
+
+    def test_default_scope_preserves_historical_behavior(self, engine):
+        # Omitting session_scope must behave identically to current.
+        engine._store.append("test-session", {"role": "user", "content": "docker default"})
+        engine._store.append("old-session", {"role": "user", "content": "docker old"})
+        result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "docker"}))
+        assert result["session_scope"] == "current"
+        sessions_seen = {hit["session_id"] for hit in result["results"]}
+        assert sessions_seen == {"test-session"}
+
+
+class TestHandleExpandStoreId:
+    """lcm_expand store_id mode for cross-session raw expansion."""
+
+    def test_store_id_returns_raw_message_cross_session(self, engine):
+        store_id = engine._store.append(
+            "old-session",
+            {"role": "user", "content": "cross session content body"},
+            source="cli",
+        )
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"store_id": store_id}))
+        assert result["source_type"] == "raw_message"
+        assert result["store_id"] == store_id
+        assert result["session_id"] == "old-session"
+        assert result["from_current_session"] is False
+        assert result["role"] == "user"
+        assert result["source"] == "cli"
+        assert result["content"].startswith("cross session content")
+
+    def test_store_id_paging_via_content_offset(self, engine):
+        big_content = "x" * 10000
+        store_id = engine._store.append(
+            "old-session", {"role": "user", "content": big_content}
+        )
+        first = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand", {"store_id": store_id, "max_tokens": 50}
+            )
+        )
+        assert first["content_truncated"] is True
+        assert first["next_content_offset"] > 0
+        second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "store_id": store_id,
+                    "max_tokens": 50,
+                    "content_offset": first["next_content_offset"],
+                },
+            )
+        )
+        assert second["content_offset"] == first["next_content_offset"]
+        assert second["content"]
+        # Combined slices should not exceed total content length.
+        assert first["content_chars"] == second["content_chars"]
+
+    def test_store_id_not_found_returns_error(self, engine):
+        result = json.loads(
+            engine.handle_tool_call("lcm_expand", {"store_id": 999_999_999})
+        )
+        assert "error" in result
+        assert "store_id" in result["error"]
+
+    def test_store_id_not_an_integer_returns_error(self, engine):
+        result = json.loads(
+            engine.handle_tool_call("lcm_expand", {"store_id": "not-an-int"})
+        )
+        assert "error" in result
+        assert "integer" in result["error"]
+
+    def test_multiple_modes_returns_error(self, engine):
+        store_id = engine._store.append(
+            "test-session", {"role": "user", "content": "x"}
+        )
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand", {"store_id": store_id, "node_id": 1}
+            )
+        )
+        assert "error" in result
+        assert "Provide only one" in result["error"]
+
+    def test_no_modes_returns_error(self, engine):
+        result = json.loads(engine.handle_tool_call("lcm_expand", {}))
+        assert "error" in result
+        assert "node_id" in result["error"] and "store_id" in result["error"]
+
+    def test_node_id_remains_session_scoped(self, engine):
+        # Node belongs to a different session — must not be expandable via node_id.
+        engine._store.append("old-session", {"role": "user", "content": "old content"})
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="old-session",
+                depth=0,
+                summary="old summary",
+                token_count=5,
+                source_token_count=5,
+                source_ids=[1],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+        result = json.loads(
+            engine.handle_tool_call("lcm_expand", {"node_id": node_id})
+        )
+        assert "error" in result
+        assert "current session" in result["error"].lower()
+
+    def test_store_id_cross_session_externalized_ref_surfaced_with_note(self, engine):
+        # Seed a foreign-session tool message that references an externalized
+        # payload. The ref string follows the produced-placeholder shape so
+        # extract_externalized_ref will pick it up.
+        placeholder = (
+            "[Externalized tool output: tool_call_id=call_abc; "
+            "chars=1234; bytes=5678; ref=foreign_payload_ref.json]"
+        )
+        store_id = engine._store.append(
+            "old-session",
+            {"role": "tool", "content": placeholder, "tool_call_id": "call_abc"},
+        )
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"store_id": store_id}))
+        assert result["source_type"] == "raw_message"
+        assert result["from_current_session"] is False
+        assert result["externalized_ref"] == "foreign_payload_ref.json"
+        # Cross-session payload metadata is intentionally omitted; an explanatory
+        # note is surfaced so callers don't treat the bare ref as expandable.
+        assert "externalized" not in result
+        assert "externalized_note" in result
+        assert "session-scoped" in result["externalized_note"].lower()
+
+    def test_grep_then_expand_round_trip_cross_session(self, engine):
+        store_id = engine._store.append(
+            "old-session", {"role": "user", "content": "phoenix payload across session"}
+        )
+        grep_result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "phoenix", "session_scope": "all"},
+            )
+        )
+        cross_hits = [
+            hit for hit in grep_result["results"]
+            if hit["type"] == "message" and hit["session_id"] == "old-session"
+        ]
+        assert cross_hits, "cross-session grep should surface the seeded message"
+        assert cross_hits[0]["store_id"] == store_id
+
+        expand_result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand", {"store_id": cross_hits[0]["store_id"]}
+            )
+        )
+        assert expand_result["source_type"] == "raw_message"
+        assert "phoenix payload" in expand_result["content"]
+
+
+class TestHandleLoadSession:
+    """Ordered, paged raw transcript loading by explicit session_id."""
+
+    def _seed_old_session(self, engine):
+        rows = [
+            ("user", "first old-session message", "cli", 100.0),
+            ("assistant", "second old-session answer", "cli", 200.0),
+            ("tool", "third old-session tool result", "cli", 300.0),
+            ("user", "fourth old-session follow-up", "telegram", 400.0),
+        ]
+        store_ids = []
+        for role, content, source, timestamp in rows:
+            store_id = engine._store.append(
+                "old-session",
+                {"role": role, "content": content, "tool_call_id": "call_x" if role == "tool" else None},
+                source=source,
+            )
+            engine._store._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+                (timestamp, store_id),
+            )
+            store_ids.append(store_id)
+        engine._store._conn.commit()
+        engine._store.append("test-session", {"role": "user", "content": "current session message"})
+        return store_ids
+
+    def test_load_session_returns_ordered_bounded_raw_page(self, engine):
+        store_ids = self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "limit": 2},
+            )
+        )
+
+        assert result["session_id"] == "old-session"
+        assert result["limit"] == 2
+        assert result["total_messages"] == 4
+        assert result["returned_messages"] == 2
+        assert result["has_more"] is True
+        assert result["next_cursor"] == store_ids[1]
+        assert [item["store_id"] for item in result["messages"]] == store_ids[:2]
+        assert [item["role"] for item in result["messages"]] == ["user", "assistant"]
+        assert result["messages"][0]["content"] == "first old-session message"
+        assert result["messages"][0]["content_chars"] == len("first old-session message")
+        assert result["messages"][0]["content_truncated"] is False
+        assert result["messages"][0]["from_current_session"] is False
+        assert "snippet" not in result["messages"][0]
+
+    def test_load_session_pages_after_store_id(self, engine):
+        store_ids = self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "after_store_id": store_ids[1], "limit": 10},
+            )
+        )
+
+        assert result["after_store_id"] == store_ids[1]
+        assert result["has_more"] is False
+        assert result["next_cursor"] is None
+        assert [item["store_id"] for item in result["messages"]] == store_ids[2:]
+
+    def test_load_session_filters_roles_and_time_range(self, engine):
+        store_ids = self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {
+                    "session_id": "old-session",
+                    "roles": ["user", "tool"],
+                    "time_from": 250.0,
+                    "time_to": 450.0,
+                    "limit": 10,
+                },
+            )
+        )
+
+        assert result["roles"] == ["user", "tool"]
+        assert result["time_from"] == 250.0
+        assert result["time_to"] == 450.0
+        assert result["total_messages"] == 2
+        assert [item["store_id"] for item in result["messages"]] == [store_ids[2], store_ids[3]]
+        assert [item["role"] for item in result["messages"]] == ["tool", "user"]
+
+    def test_load_session_bounds_large_message_content(self, engine):
+        store_id = engine._store.append(
+            "large-session",
+            {"role": "assistant", "content": "abcdef"},
+            source="cli",
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "large-session", "max_content_chars": 3},
+            )
+        )
+
+        assert result["max_content_chars"] == 3
+        assert result["messages"][0]["store_id"] == store_id
+        assert result["messages"][0]["content"] == "abc"
+        assert result["messages"][0]["content_chars"] == 6
+        assert result["messages"][0]["content_returned_chars"] == 3
+        assert result["messages"][0]["content_truncated"] is True
+        assert result["messages"][0]["next_content_offset"] == 3
+
+    def test_load_session_clamps_max_content_chars(self, engine):
+        store_id = engine._store.append(
+            "large-session",
+            {"role": "user", "content": "x" * 25_000},
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "large-session", "max_content_chars": 50_000},
+            )
+        )
+
+        assert result["max_content_chars"] == 20_000
+        assert result["max_content_chars_clamped_from"] == 50_000
+        assert result["messages"][0]["store_id"] == store_id
+        assert len(result["messages"][0]["content"]) == 20_000
+        assert result["messages"][0]["content_truncated"] is True
+
+    def test_load_session_rejects_missing_session_id_and_invalid_filters(self, engine):
+        missing = json.loads(engine.handle_tool_call("lcm_load_session", {}))
+        assert "error" in missing and "session_id" in missing["error"]
+
+        bad_roles = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "roles": "user"},
+            )
+        )
+        assert "error" in bad_roles and "roles" in bad_roles["error"]
+
+        bad_cursor = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "after_store_id": "not-an-id"},
+            )
+        )
+        assert "error" in bad_cursor and "after_store_id" in bad_cursor["error"]
+
+        bad_limit = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "limit": "not-a-limit"},
+            )
+        )
+        assert "error" in bad_limit and "limit" in bad_limit["error"]
+
+        bad_max_content_chars = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "max_content_chars": "not-a-size"},
+            )
+        )
+        assert "error" in bad_max_content_chars and "max_content_chars" in bad_max_content_chars["error"]
+
+        bad_range = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "time_from": 5, "time_to": 4},
+            )
+        )
+        assert "error" in bad_range and "time_to" in bad_range["error"]
+
+    def test_load_session_clamps_limit_and_never_falls_back_to_current(self, engine):
+        self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "missing-session", "limit": 5000},
+            )
+        )
+
+        assert result["session_id"] == "missing-session"
+        assert result["limit"] == 200
+        assert result["limit_clamped_from"] == 5000
+        assert result["total_messages"] == 0
+        assert result["messages"] == []
+        assert result["has_more"] is False
 
 
 class TestExtractionDuringCompress:

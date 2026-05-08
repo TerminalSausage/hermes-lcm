@@ -3,11 +3,13 @@
 LCM_GREP = {
     "name": "lcm_grep",
     "description": (
-        "Search the current session's conversation history — raw messages AND summaries across all depths — "
-        "to recover details from earlier in the active conversation, even if those turns were compacted. "
-        "Prefer this for intra-session recall. If the user is asking about an earlier separate conversation "
-        "or broad cross-session history, prefer session_search instead. Returns matches with depth labels "
-        "showing where each result lives."
+        "Search the plugin-local LCM database for past conversation content. "
+        "Default scope is the active session and returns both raw messages and summary nodes across all depths. "
+        "Broader scopes ('all' or 'session') must be requested explicitly and exist for bounded archive recovery "
+        "over rows already present in lcm.db, including externally backfilled rows that may carry source strings "
+        "such as openclaw-lcm:* . In broader scopes only raw-message hits are returned; cross-session summary "
+        "node expansion is intentionally deferred. Use lcm_expand(store_id=...) on a cross-session message hit "
+        "to drill into its full content. For Hermes-tracked session history outside the LCM database, use session_search."
     ),
     "parameters": {
         "type": "object",
@@ -22,7 +24,10 @@ LCM_GREP = {
             },
             "limit": {
                 "type": "integer",
-                "description": "Max results to return (default 10)",
+                "description": (
+                    "Max results to return (default 10, hard upper bound 200). "
+                    "Values above the cap are clamped and reported via limit_clamped_from in the response."
+                ),
                 "default": 10,
             },
             "sort": {
@@ -36,12 +41,23 @@ LCM_GREP = {
             },
             "session_scope": {
                 "type": "string",
-                "enum": ["current"],
+                "enum": ["current", "all", "session"],
                 "description": (
-                    "Whether to search only the current session. "
-                    "Cross-session recall should use session_search instead."
+                    "Scope of the search across the plugin-local LCM database. "
+                    "'current' (default) restricts to the active session and preserves historical behavior. "
+                    "'all' searches every session in the local LCM database. "
+                    "'session' restricts to the session_id supplied via the session_id parameter. "
+                    "Cross-session search returns snippets and message store_ids; cross-session summary node expansion is deferred. "
+                    "For Hermes-tracked session history outside the LCM database, use session_search."
                 ),
                 "default": "current",
+            },
+            "session_id": {
+                "type": "string",
+                "description": (
+                    "When session_scope='session', the explicit session id to restrict the search to. "
+                    "Must not be supplied with session_scope='current' or session_scope='all'."
+                ),
             },
             "source": {
                 "type": "string",
@@ -53,6 +69,65 @@ LCM_GREP = {
             },
         },
         "required": ["query"],
+    },
+}
+
+LCM_LOAD_SESSION = {
+    "name": "lcm_load_session",
+    "description": (
+        "Load an ordered raw-message transcript page for one explicit session_id from the plugin-local LCM database. "
+        "This is enumeration, not search: it does not require a query, returns raw message content rather than snippets, "
+        "and orders rows chronologically by store_id. Use this after session_search or lcm_grep has identified a session_id "
+        "that already exists in lcm.db. Output is bounded by limit, per-row content is bounded by max_content_chars, "
+        "and row pagination uses after_store_id/next_cursor. "
+        "It returns raw rows only; cross-session summary/DAG expansion remains out of scope."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Explicit LCM session id to load. Required; no implicit current/all fallback is applied.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    "Maximum raw messages to return (default 100, hard upper bound 200). "
+                    "Values above the cap are clamped and reported via limit_clamped_from."
+                ),
+                "default": 100,
+            },
+            "max_content_chars": {
+                "type": "integer",
+                "description": (
+                    "Maximum content characters to include per message (default 4000, hard upper bound 20000). "
+                    "Longer rows include content_truncated=true and can be recovered fully with lcm_expand(store_id=...)."
+                ),
+                "default": 4000,
+            },
+            "after_store_id": {
+                "type": "integer",
+                "description": (
+                    "Exclusive cursor for pagination. Pass the previous response's next_cursor "
+                    "to continue with rows whose store_id is greater than this value."
+                ),
+                "default": 0,
+            },
+            "roles": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional role filter, for example ['user', 'assistant', 'tool', 'system'].",
+            },
+            "time_from": {
+                "type": "number",
+                "description": "Optional inclusive minimum message timestamp (Unix seconds).",
+            },
+            "time_to": {
+                "type": "number",
+                "description": "Optional inclusive maximum message timestamp (Unix seconds).",
+            },
+        },
+        "required": ["session_id"],
     },
 }
 
@@ -87,29 +162,58 @@ LCM_DESCRIBE = {
 LCM_EXPAND = {
     "name": "lcm_expand",
     "description": (
-        "Recover the original detail behind a current session summary node, or open an "
-        "externalized payload ref directly. Given a node_id, returns the "
-        "source messages or lower-depth summaries that were compacted into "
-        "that node. Given externalized_ref, returns the stored payload "
-        "content plus metadata. Use after lcm_describe to drill into "
-        "specific parts of the active conversation or large externalized "
-        "tool output. For cross-session recall, prefer session_search first."
+        "Recover the original detail behind a summary node, externalized payload, or raw message. "
+        "Mode selection (exactly one): node_id (current session only) returns the source messages "
+        "or lower-depth summaries that were compacted into a summary node; externalized_ref "
+        "(current session only) returns a stored externalized payload's content; store_id returns "
+        "a single raw message by store_id and works across sessions, suitable for drilling into "
+        "cross-session lcm_grep results. Output is bounded by max_tokens; raw recovery is pageable "
+        "via content_offset (and source_offset/source_limit for node_id mode). For Hermes-tracked "
+        "session history outside the LCM database, prefer session_search."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "node_id": {
                 "type": "integer",
-                "description": "Summary node ID to expand",
+                "description": (
+                    "Summary node ID to expand. Current-session only — cross-session DAG expansion "
+                    "is not supported in this version."
+                ),
             },
             "externalized_ref": {
                 "type": "string",
-                "description": "Optional externalized payload ref filename to expand instead of a summary node.",
+                "description": "Externalized payload ref filename to expand instead of a summary node. Current-session only.",
+            },
+            "store_id": {
+                "type": "integer",
+                "description": (
+                    "Raw message store_id to fetch. Works across sessions, so a store_id surfaced by "
+                    "a cross-session lcm_grep result can be expanded directly. Returns the message's "
+                    "content paged by content_offset. If the row references an externalized payload, "
+                    "the ref is surfaced via 'externalized_ref'; payload metadata and content are "
+                    "session-scoped, so a cross-session row also includes 'externalized_note' "
+                    "explaining that the ref is for traceability only and cannot be expanded in this version."
+                ),
             },
             "max_tokens": {
                 "type": "integer",
                 "description": "Token budget for returned content (default 4000)",
                 "default": 4000,
+            },
+            "source_offset": {
+                "type": "integer",
+                "description": "Zero-based pagination offset into the node's immediate source list (node_id mode only).",
+                "default": 0,
+            },
+            "source_limit": {
+                "type": "integer",
+                "description": "Maximum number of immediate sources to return from source_offset (node_id mode only). Output still respects max_tokens.",
+            },
+            "content_offset": {
+                "type": "integer",
+                "description": "Character offset used to continue an oversized raw message, externalized payload, or store_id-mode message. Use next_content_offset from the previous response.",
+                "default": 0,
             },
         },
         "required": [],
@@ -121,8 +225,10 @@ LCM_STATUS = {
     "description": (
         "Get a quick health overview of the LCM engine for the current session. "
         "Shows compression count, store size, DAG depth distribution, context usage, "
-        "and active configuration. Use this to understand how much history has been "
-        "compacted and how the engine is performing."
+        "active configuration, and session/message filter state. Use this to "
+        "understand how much history has been compacted, how the engine is "
+        "performing, whether the current session is matched by ignore or stateless "
+        "session patterns, and which message noise-suppression patterns are loaded."
     ),
     "parameters": {
         "type": "object",
@@ -177,8 +283,13 @@ LCM_EXPAND_QUERY = {
             },
             "max_tokens": {
                 "type": "integer",
-                "description": "Max answer tokens for synthesis (default 2000)",
+                "description": "Max answer tokens for bounded synthesis returned to the main agent (default 2000)",
                 "default": 2000,
+            },
+            "context_max_tokens": {
+                "type": "integer",
+                "description": "Expanded serialized summary/raw/child-source/externalized fresh context budget for the auxiliary LLM before it returns the bounded answer (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
+                "default": 32000,
             },
         },
         "required": ["prompt"],

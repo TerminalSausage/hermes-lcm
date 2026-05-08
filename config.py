@@ -1,6 +1,12 @@
 """LCM configuration with defaults and env var overrides."""
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+try:
+    import yaml
+except Exception:  # pragma: no cover - optional fallback for minimal installs
+    yaml = None
 
 
 def _parse_pattern_list(raw: str) -> list[str]:
@@ -37,6 +43,40 @@ def _parse_bool_env(key: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _hermes_compression_threshold(default: float) -> float:
+    """Read Hermes compression.threshold when no LCM env override is present.
+
+    Hermes gateways may load ``~/.hermes/config.yaml`` without exporting every
+    setting into the process environment. Falling back to the main Hermes
+    compression threshold keeps LCM aligned with the active agent config while
+    still allowing ``LCM_CONTEXT_THRESHOLD`` to override it explicitly.
+    """
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    cfg_path = home / "config.yaml"
+    try:
+        text = cfg_path.read_text()
+        if yaml is not None:
+            cfg = yaml.safe_load(text) or {}
+            value = (cfg.get("compression") or {}).get("threshold")
+            if value is None:
+                return default
+            return float(value)
+
+        in_compression = False
+        for raw_line in text.splitlines():
+            line = raw_line.split("#", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            if not line.startswith((" ", "\t")):
+                in_compression = line.strip() == "compression:"
+                continue
+            if in_compression and line.strip().startswith("threshold:"):
+                return float(line.split(":", 1)[1].strip().strip("'\""))
+        return default
+    except Exception:
+        return default
 
 
 @dataclass
@@ -85,14 +125,17 @@ class LCMConfig:
     # (0 = disabled). Effective cap becomes context_length - reserve_tokens_floor.
     reserve_tokens_floor: int = 0
 
-    # -- Session filtering ---
+    # -- Session and message filtering ---
     # Sessions to exclude from LCM storage entirely.
     ignore_session_patterns: list[str] = field(default_factory=list)
     # Sessions that may read carried-over LCM state but never write new data.
     stateless_session_patterns: list[str] = field(default_factory=list)
+    # Per-message regex patterns; matching messages are skipped before LCM storage.
+    ignore_message_patterns: list[str] = field(default_factory=list)
     # Diagnostics: where each pattern list came from.
     ignore_session_patterns_source: str = "default"
     stateless_session_patterns_source: str = "default"
+    ignore_message_patterns_source: str = "default"
 
     # -- Summary instructions ---
     # Custom instructions injected into all summarization prompts
@@ -121,6 +164,8 @@ class LCMConfig:
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
+    # Serialized summary/raw/child-source/externalized context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
+    expansion_context_tokens: int = 32_000
 
     # -- Timeouts ---
     summary_timeout_ms: int = 60_000
@@ -145,7 +190,10 @@ class LCMConfig:
 
         c.fresh_tail_count = _int("LCM_FRESH_TAIL_COUNT", c.fresh_tail_count)
         c.leaf_chunk_tokens = _int("LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens)
-        c.context_threshold = _float("LCM_CONTEXT_THRESHOLD", c.context_threshold)
+        c.context_threshold = _float(
+            "LCM_CONTEXT_THRESHOLD",
+            _hermes_compression_threshold(c.context_threshold),
+        )
         c.incremental_max_depth = _int("LCM_INCREMENTAL_MAX_DEPTH", c.incremental_max_depth)
         c.condensation_fanin = _int("LCM_CONDENSATION_FANIN", c.condensation_fanin)
         c.dynamic_leaf_chunk_enabled = _parse_bool_env(
@@ -194,6 +242,7 @@ class LCMConfig:
         )
         c.summary_model = _str("LCM_SUMMARY_MODEL", c.summary_model)
         c.expansion_model = _str("LCM_EXPANSION_MODEL", c.expansion_model)
+        c.expansion_context_tokens = _int("LCM_EXPANSION_CONTEXT_TOKENS", c.expansion_context_tokens)
         c.summary_timeout_ms = _int("LCM_SUMMARY_TIMEOUT_MS", c.summary_timeout_ms)
         c.expansion_timeout_ms = _int("LCM_EXPANSION_TIMEOUT_MS", c.expansion_timeout_ms)
         c.database_path = _str("LCM_DATABASE_PATH", c.database_path)
@@ -212,5 +261,10 @@ class LCMConfig:
         if raw_stateless is not None:
             c.stateless_session_patterns = _parse_pattern_list(raw_stateless)
             c.stateless_session_patterns_source = "env"
+
+        raw_ignore_messages = os.environ.get("LCM_IGNORE_MESSAGE_PATTERNS")
+        if raw_ignore_messages is not None:
+            c.ignore_message_patterns = _parse_pattern_list(raw_ignore_messages)
+            c.ignore_message_patterns_source = "env"
 
         return c

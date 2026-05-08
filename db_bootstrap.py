@@ -122,6 +122,10 @@ def ensure_lifecycle_state_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE lcm_lifecycle_state ADD COLUMN last_maintenance_attempt_at REAL"
         )
+    if "last_rollover_at" not in columns:
+        conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN last_rollover_at REAL")
+    if "last_reset_at" not in columns:
+        conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN last_reset_at REAL")
 
 
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
@@ -175,7 +179,7 @@ def quote_sql_identifier(identifier: str) -> str:
     return f'"{identifier}"'
 
 
-def _fts_needs_rebuild(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
     shadow_tables = get_fts_shadow_table_names(spec.table_name)
     existing_tables = get_existing_table_names(conn, [spec.table_name, *shadow_tables])
     if spec.table_name not in existing_tables:
@@ -208,14 +212,58 @@ def _fts_needs_rebuild(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -
         ).fetchone()[0]
         if int(content_count or 0) != int(fts_count or 0):
             return True
-
-        conn.execute(
-            f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}, rank) VALUES('integrity-check', 1)"
-        )
     except sqlite3.DatabaseError:
         return True
 
     return False
+
+
+def _fts_needs_rebuild(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+    if _fts_needs_rebuild_structural(conn, spec):
+        return True
+    return check_external_content_fts_integrity(conn, spec)["status"] == "fail"
+
+
+def check_external_content_fts_integrity(
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+) -> dict[str, str]:
+    """Run SQLite's FTS5 integrity-check for an external-content table.
+
+    FTS5 exposes this as a special INSERT command. Wrap it in a savepoint and
+    roll it back so diagnostics can verify the index without leaving any state
+    behind on the shared connection.
+    """
+
+    if _fts_needs_rebuild_structural(conn, spec):
+        return {"status": "fail", "detail": "structural repair needed"}
+
+    savepoint = f"lcm_fts_integrity_{spec.table_name}"
+    savepoint_sql = quote_sql_identifier(savepoint)
+    try:
+        conn.execute(f"SAVEPOINT {savepoint_sql}")
+        conn.execute(
+            f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}, rank) VALUES('integrity-check', 1)"
+        )
+    except sqlite3.DatabaseError as exc:
+        try:
+            conn.execute(f"ROLLBACK TO {savepoint_sql}")
+            conn.execute(f"RELEASE {savepoint_sql}")
+        except sqlite3.DatabaseError:
+            pass
+        detail = str(exc)
+        lowered = detail.lower()
+        if "readonly" in lowered or "read-only" in lowered:
+            return {"status": "unchecked", "detail": detail}
+        return {"status": "fail", "detail": detail}
+
+    try:
+        conn.execute(f"ROLLBACK TO {savepoint_sql}")
+        conn.execute(f"RELEASE {savepoint_sql}")
+    except sqlite3.DatabaseError as exc:
+        return {"status": "fail", "detail": str(exc)}
+
+    return {"status": "pass", "detail": "ok"}
 
 
 def _drop_fts_table(conn: sqlite3.Connection, table_name: str) -> None:
@@ -256,7 +304,30 @@ def _check_disk_space(db_path: str) -> bool:
         return True
 
 
-def ensure_external_content_fts(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
+def _fts_missing_triggers(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+    expected = {
+        trigger_name
+        for trigger_name in (_extract_trigger_name(sql) for sql in spec.trigger_sqls)
+        if trigger_name
+    }
+    if not expected:
+        return False
+    placeholders = ",".join("?" for _ in expected)
+    rows = conn.execute(
+        f"SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ({placeholders})",
+        tuple(sorted(expected)),
+    ).fetchall()
+    existing = {str(row[0]) for row in rows if row and row[0]}
+    return bool(expected - existing)
+
+
+def external_content_fts_needs_repair(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+    return _fts_needs_rebuild_structural(conn, spec) or _fts_missing_triggers(conn, spec)
+
+
+def repair_external_content_fts(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> dict[str, bool]:
+    rebuilt = False
+    degraded = False
     if _fts_needs_rebuild(conn, spec):
         db_path = conn.execute("PRAGMA database_list").fetchone()
         if db_path:
@@ -268,7 +339,8 @@ def ensure_external_content_fts(conn: sqlite3.Connection, spec: ExternalContentF
                     _MIN_DISK_SPACE_BYTES // (1024 * 1024),
                 )
                 _drop_fts_artifacts(conn, spec)
-                return
+                conn.commit()
+                return {"rebuilt": False, "degraded": True, "triggers_recreated": False}
         _drop_fts_table(conn, spec.table_name)
         conn.execute(
             f"""
@@ -282,9 +354,17 @@ def ensure_external_content_fts(conn: sqlite3.Connection, spec: ExternalContentF
         conn.execute(
             f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}) VALUES('rebuild')"
         )
+        rebuilt = True
 
+    triggers_were_missing = _fts_missing_triggers(conn, spec)
     for trigger_sql in spec.trigger_sqls:
         conn.execute(trigger_sql)
+    conn.commit()
+    return {"rebuilt": rebuilt, "degraded": degraded, "triggers_recreated": triggers_were_missing}
+
+
+def ensure_external_content_fts(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
+    repair_external_content_fts(conn, spec)
 
 
 def run_versioned_migrations(conn: sqlite3.Connection) -> None:
