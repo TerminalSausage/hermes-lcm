@@ -40,19 +40,43 @@ def register(ctx):
     # Register as the context engine (replaces ContextCompressor)
     ctx.register_context_engine(engine)
 
+    # --- /lcm slash command registration ---
+    # Upstream requires LCM_ENABLE_SLASH_COMMAND=1 AND a proper ctx.register_command.
+    # The Hermes _EngineCollector loader does NOT provide register_command, so the
+    # upstream path always falls through. Our patch adds a fallback that injects
+    # directly into the PluginManager singleton.
     register_command = getattr(ctx, "register_command", None)
     slash_enabled = _env_flag_enabled("LCM_ENABLE_SLASH_COMMAND", default=False)
+    _lcm_registered = False
+
     if callable(register_command) and slash_enabled:
         from .command import handle_lcm_command
-
         register_command(
             "lcm",
             lambda raw_args: handle_lcm_command(raw_args, engine),
             description="LCM status and diagnostics",
         )
-    elif callable(register_command):
-        logger.info("LCM slash command registration disabled (set LCM_ENABLE_SLASH_COMMAND=1 to enable /lcm)")
-    else:
-        logger.info("LCM slash command registration unavailable on this Hermes host; continuing without /lcm")
+        _lcm_registered = True
+
+    # NachoTek patch: fallback when _EngineCollector lacks register_command
+    if not _lcm_registered and slash_enabled:
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            from .command import handle_lcm_command
+            _mgr = get_plugin_manager()
+            _mgr._plugin_commands["lcm"] = {
+                "handler": lambda raw_args: handle_lcm_command(raw_args, engine),
+                "description": "LCM status and diagnostics",
+                "plugin": "lcm",
+            }
+            _lcm_registered = True
+            logger.info("LCM /lcm command registered via PluginManager fallback")
+        except Exception as _fallback_err:
+            logger.warning("LCM PluginManager fallback failed: %s", _fallback_err)
+
+    if not _lcm_registered and not slash_enabled:
+        logger.info("LCM slash command disabled (set LCM_ENABLE_SLASH_COMMAND=1 to enable /lcm)")
+    elif not _lcm_registered:
+        logger.warning("LCM slash command registration failed on all paths")
 
     logger.info("LCM plugin loaded — lossless context management active")
